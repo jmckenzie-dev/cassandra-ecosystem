@@ -1,0 +1,101 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.sidecar.utils;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.netty.handler.codec.http.HttpResponseStatus;
+import io.vertx.ext.web.RoutingContext;
+import org.apache.cassandra.sidecar.common.data.OperationalJobStatus;
+import org.apache.cassandra.sidecar.common.response.OperationalJobResponse;
+import org.apache.cassandra.sidecar.exceptions.OperationalJobConflictException;
+import org.apache.cassandra.sidecar.job.OperationalJobInfo;
+
+import static org.apache.cassandra.sidecar.common.data.OperationalJobStatus.FAILED;
+
+/**
+ * Utility class for OperationalJob framework operations.
+ */
+public class OperationalJobUtils
+{
+    private static final Logger LOGGER = LoggerFactory.getLogger(OperationalJobUtils.class);
+
+    /**
+     * Sends an HTTP response with appropriate status code and {@link OperationalJobResponse} payload
+     * based on the operational job status and any conflict exceptions.
+     * If an exception is provided, responds with HTTP 409 CONFLICT and FAILED status.
+     * Otherwise, responds with HTTP 200 OK for completed jobs or HTTP 202 ACCEPTED for ongoing jobs.
+     *
+     * @param context   the routing context for the HTTP request
+     * @param job       the operational job to report status on
+     * @param exception the conflict exception, if any (null if no conflict)
+     */
+    public static void sendStatusBasedResponse(RoutingContext context, OperationalJobInfo job, OperationalJobConflictException exception)
+    {
+        if (exception != null)
+        {
+            String reason = exception.getMessage();
+            LOGGER.error("Conflicting job encountered. reason={}", reason);
+            context.response().setStatusCode(HttpResponseStatus.CONFLICT.code());
+            context.json(OperationalJobResponse.builder()
+                                               .jobId(job.jobId())
+                                               .status(OperationalJobStatus.FAILED)
+                                               .operation(job.name())
+                                               .reason(reason)
+                                               .startTime(job.startTime())
+                                               .nodesPending(job.nodesPending())
+                                               .nodesExecuting(job.nodesExecuting())
+                                               .nodesSucceeded(job.nodesSucceeded())
+                                               .nodesFailed(job.nodesFailed())
+                                               .lastUpdate(job.lastUpdate())
+                                               .build());
+            return;
+        }
+
+        OperationalJobStatus status = job.status();
+        LOGGER.info("Job completion status={} jobId={}", status, job.jobId());
+        if (status.isCompleted())
+        {
+            context.response().setStatusCode(HttpResponseStatus.OK.code());
+        }
+        else
+        {
+            context.response().setStatusCode(HttpResponseStatus.ACCEPTED.code());
+        }
+
+        String reason = null;
+        if (status == FAILED)
+        {
+            reason = job.failureReason();
+        }
+        context.json(OperationalJobResponse.builder()
+                                           .jobId(job.jobId())
+                                           .status(status)
+                                           .operation(job.name())
+                                           .reason(reason)
+                                           .startTime(job.startTime())
+                                           .nodesPending(job.nodesPending())
+                                           .nodesExecuting(job.nodesExecuting())
+                                           .nodesSucceeded(job.nodesSucceeded())
+                                           .nodesFailed(job.nodesFailed())
+                                           .lastUpdate(job.lastUpdate())
+                                           .build());
+    }
+}

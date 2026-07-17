@@ -1,0 +1,77 @@
+# Sidecar Development Guide
+
+If you're reading this document then you've decided to contribute to the Sidecar for Apache Cassandra.
+
+## Building
+
+    ./gradlew build
+
+Packages can be built using the following Gradle commands:
+
+    ./gradlew buildDeb
+    ./gradlew buildRpm
+
+## Project Layout
+
+### Common
+
+Contains the libraries which are shared between the version specific Cassandra code as well as the dependencies of Cassandra itself.
+
+### adapters
+
+Implementation of ICassandraAdapter and related classes for different Cassandra versions.
+
+#### adapters/base
+
+Implementation of ICassandraAdapter and related classes for Cassandra 4.0.
+
+### Cassandra Integration Tests
+
+Cassandra integration tests leverage the in-jvm dtest framework to create Cassandra nodes and test the different implementations of the ICassandraAdapters against real C* nodes.
+
+The integration tests will not run by default when running `./gradlew test` since they require a bit of setup.
+
+#### Running Integration Tests
+
+Integration tests can be run with the following:
+
+    ./gradlew integrationTest
+
+
+#### Tests
+
+Integration tests should be marked as integration tests with the @CassandraIntegrationTest annotation:
+
+    @CassandraIntegrationTest
+    void myTestHere(CassandraTestContext context)
+    {
+        //
+    }
+
+The `CassandraTestTemplate` will handle starting up each of the instance(s) for testing and inject the
+`CassandraTestContext`, which will have the version, CQLSession, and other useful information required for testing.
+
+### Main Project
+
+The main project consumes the various Cassandra versions via the CassandraAdapterDelegate.  When connecting to the server,
+the delegate will discover the version and choose the best `ICassandraAdapter` to match the server version.
+
+
+## Testing
+
+Our official CI for this project is CircleCI.
+
+We strive for high quality, thoroughly tested code.
+
+Some tests require docker to be installed locally to run Cassandra.
+
+## Issue Tracker
+
+File bugs or look for issues to work on in our project JIRA: https://issues.apache.org/jira/browse/CASSANDRASC
+
+## Submitting Patches
+
+You may open a PR against our project: http://github.com/apache/cassandra-sidecar
+
+Please link to the PR from the JIRA ticket.  All work *must* have a corresponding JIRA ticket.  Please put the JIRA ID in the body of the pull request.
+

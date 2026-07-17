@@ -1,0 +1,534 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+
+import com.github.spotbugs.snom.SpotBugsTask
+import org.nosphere.apache.rat.RatTask
+
+import java.nio.file.Files
+import java.nio.file.Paths
+
+buildscript {
+    dependencies {
+        // findBugs needs a newer version of Guava in the buildscript.
+        // otherwise it throws an exception
+        classpath "com.google.guava:guava:28.2-jre"
+    }
+}
+
+plugins {
+    id 'idea'
+    id 'java'
+    id 'application'
+    // Used to sign built artifacts
+    id 'signing'
+
+    // since we're using a specific version here, we delay applying the plugin till the all projects
+    id "com.github.spotbugs" version "6.0.20" apply false
+
+    // Help resolve dependency conflicts between jib and ospackage
+    // See: https://github.com/GoogleContainerTools/jib/issues/4235#issuecomment-2088829367
+    id('com.google.cloud.tools.jib') version '3.4.4' apply false
+
+    // https://github.com/nebula-plugins/gradle-ospackage-plugin/wiki
+    id "com.netflix.nebula.ospackage" version "11.10.0"
+    id 'com.netflix.nebula.ospackage-application' version "11.10.0"
+    id 'org.asciidoctor.jvm.convert' version '3.3.2'
+
+    // Release Audit Tool (RAT) plugin for checking project licenses
+    id("org.nosphere.apache.rat") version "0.8.0"
+
+    id 'jacoco'
+}
+
+ext {
+    // A common method to handle loading gradle properties with a default when
+    // no definition is found. The property value is determined by the following
+    // priority order (top is highest priority):
+    //    - gradle property (-Pproperty=value)
+    //    - system property (-Dproperty=value)
+    //    - environment variable
+    //    - default value
+    // See more details on gradle property handling here:
+    //    https://docs.gradle.org/current/userguide/build_environment.html#sec:gradle_properties_and_system_properties
+    propertyWithDefault = { property, defaultValue ->
+        def value = defaultValue
+        def envValue = System.getenv(property)
+        if (envValue != null) {
+            value = envValue
+        }
+        def systemValue = System.getProperty(property)
+        if (systemValue != null) {
+            value = systemValue
+        }
+        def projectValue = project.hasProperty(property) ? project.property(property) : null
+        if (projectValue != null) {
+            value = projectValue
+        }
+        return value
+    }
+
+    // Returns true if the property has been set, otherwise false.
+    propertyExists = { property ->
+        System.getenv(property) != null || System.getProperty(property) != null || project.hasProperty(property)
+    }
+
+    dependencyLocation = propertyWithDefault("CASSANDRA_DEP_DIR", "${rootDir}/dtest-jars") + "/"
+    tarballsDir = propertyWithDefault("CASSANDRA_TARBALL_DIR", "${rootDir}/cassandra-tarballs") + "/"
+
+    // This allows simplified builds and local maven installs.
+    forceSigning = propertyExists("forceSigning")
+    skipSigning = propertyExists("skipSigning")
+    shouldSign =
+            // Always sign artifacts if -PforceSigning is passed.
+            forceSigning ||
+                    // Skip signing artifacts by default if -PskipSigning is passed.
+                    (!skipSigning
+                            // Sign artifacts if the version is not a snapshot, and we are uploading them to maven.
+                            && !version.endsWith("SNAPSHOT")
+                            && project.gradle.startParameter.taskNames.any { it.contains("upload") })
+    // either specify -x integrationTest or a property/environment variable skipIntegrationTest
+    skipIntegrationTest = propertyExists("skipIntegrationTest") || "integrationTest" in project.gradle.startParameter.excludedTaskNames
+
+}
+
+apply from: "${project.rootDir}/gradle/common/environmentChecks.gradle"
+
+// Force checkstyle, rat, and spotBugs to run before test tasks for faster feedback
+def codeCheckTasks = task("codeCheckTasks")
+
+tasks.register('checkstyle') {
+    description = 'Runs all checkstyle tasks'
+    group = 'verification'
+    dependsOn(allprojects.collect { it.tasks.withType(Checkstyle) })
+}
+
+allprojects {
+    apply plugin: 'jacoco'
+    apply plugin: 'checkstyle'
+
+    // do not run spot-bug on test-specific sub-projects
+    if (!it.name.startsWith('integration-') && !it.name.startsWith("test-")) {
+        apply plugin: "com.github.spotbugs"
+        spotbugs {
+            toolVersion = '4.2.3'
+            excludeFilter = file("${project.rootDir}/spotbugs-exclude.xml")
+        }
+        codeCheckTasks.dependsOn(tasks.withType(SpotBugsTask))
+        tasks.withType(Test) {
+            // define the order of the tasks, if SpotBugsTask runs
+            shouldRunAfter(tasks.withType(SpotBugsTask))
+        }
+    }
+
+    repositories {
+        mavenCentral()
+
+        // for dtest jar
+        mavenLocal()
+        // Confluent Schema Registry artifacts (kafka-avro-serializer)
+        maven { url "https://packages.confluent.io/maven/" }
+    }
+
+    checkstyle {
+        toolVersion '7.8.1'
+        configFile file("${project.rootDir}/checkstyle.xml")
+    }
+
+    // must run the dependant tasks in order to run codeCheckTasks
+    codeCheckTasks.dependsOn(tasks.withType(Javadoc))
+    codeCheckTasks.dependsOn(tasks.withType(Checkstyle))
+    codeCheckTasks.dependsOn(tasks.withType(RatTask))
+
+    tasks.withType(Test) {
+        // define the order of the tasks, if the below tasks runs
+        shouldRunAfter(codeCheckTasks)
+        shouldRunAfter(tasks.withType(Checkstyle))
+        shouldRunAfter(tasks.withType(RatTask))
+        dependsOn(rootProject.tasks.named('checkEnvironment'))
+    }
+}
+
+group 'org.apache.cassandra'
+version project.version
+
+application {
+    // Take the application out once we're running via Cassandra
+    mainClassName = "org.apache.cassandra.sidecar.CassandraSidecarDaemon"
+    applicationName = 'cassandra-sidecar'
+    applicationDefaultJvmArgs = ["PLACEHOLDER"]
+}
+
+startScripts {
+    doLast {
+        // Config file location should be in file:/// format for local files,
+        def confFile = "file:" + File.separator + File.separator + "\${APP_HOME}/conf/sidecar.yaml"
+        def logbackConfFile = "file:" + File.separator + File.separator + "\${APP_HOME}/conf/logback.xml"
+        // intentionally not added file:// as that is not doing well with logback
+        def logDir = "\${APP_HOME}/logs"
+
+        // As of Gradle version 7.2, the generated bin/cassandra-sidecar file by default is configured to not allow
+        // shell fragments. Thus, variables like APP_HOME are treated as literals, which prevents us from being able to
+        // start up cassandra-sidecar. See this comment on bin/cassandra-sidecar (line 208):
+        //
+        // # Collect all arguments for the java command:
+        // #   * DEFAULT_JVM_OPTS, JAVA_OPTS, JAVA_OPTS, and optsEnvironmentVar are not allowed to contain shell fragments,
+        // #     and any embedded shellness will be escaped.
+        // #   * For example: A user cannot expect ${Hostname} to be expanded, as it is an environment variable and will be
+        // #     treated as '${Hostname}' itself on the command line.
+        //
+        // Replacing the placeholder after the script has been generated will preserve the semantics from Gradle < 7.2.
+        // See this Gradle issue for more context: https://github.com/gradle/gradle/issues/18170.
+
+        def defaultJvmOpts = project.ext.JDK11_OPTIONS +
+                ["-Dsidecar.logdir=" + logDir,
+                 "-Dsidecar.config=" + confFile,
+                 "-Dlogback.configurationFile=" + logbackConfFile,
+                 "-Dvertx.logger-delegate-factory-class-name=io.vertx.core.logging.SLF4JLogDelegateFactory"]
+        unixScript.text = unixScript.text.replace("DEFAULT_JVM_OPTS='\"PLACEHOLDER\"'",
+                "DEFAULT_JVM_OPTS=\"${defaultJvmOpts.join(" ")}\"")
+        windowsScript.delete()
+    }
+}
+
+apply from: "${project.rootDir}/gradle/common/java11Options.gradle"
+
+run {
+    def confFile = System.getProperty("sidecar.config", "file:" + File.separator + File.separator + "$projectDir/conf/sidecar.yaml")
+    println "Sidecar configuration file $confFile"
+    jvmArgs = ["-Dsidecar.logdir=./logs",
+               "-Dsidecar.config=" + confFile,
+               "-Dlogback.configurationFile=./conf/logback.xml",
+               "-Dvertx.logger-delegate-factory-class-name=io.vertx.core.logging.SLF4JLogDelegateFactory"]
+    jvmArgs += project.ext.JDK11_OPTIONS
+}
+
+distributions {
+    main {
+        distributionBaseName = 'apache-cassandra-sidecar'
+        contents {
+            from 'LICENSE.txt'
+            // Include the "conf" directory in the distribution
+            from('conf') {
+                into('conf')
+            }
+            setDuplicatesStrategy(DuplicatesStrategy.INCLUDE)
+        }
+    }
+    // Packages the sources as a tarball for distribution
+    sources {
+        distributionBaseName = 'apache-cassandra-sidecar'
+        distributionClassifier = 'src'
+        contents {
+            from '.'
+            include '**/*.*'
+            exclude '**.gradle/**'
+            exclude '**.idea/**'
+            exclude 'bin/**'
+            exclude 'dtest-jars/**'
+            exclude 'cassandra-tarballs/**'
+            exclude '**lib/**'
+            exclude '**logs/**'
+            exclude '**/build/**'
+            exclude '**/out/**'
+            exclude '**/target/**'
+        }
+    }
+}
+
+configurations {
+    runtime.exclude(group: "com.google.code.findbugs", module: "jsr305")
+    runtime.exclude(group: "org.codehaus.mojo", module: "animal-sniffer-annotations")
+    runtime.exclude(group: "com.google.guava", module: "listenablefuture")
+    runtime.exclude(group: "org.checkerframework", module: "checker-qual")
+    runtime.exclude(group: "com.google.errorprone", module: "error_prone_annotations")
+    runtime.exclude(group: 'com.github.jnr', module: 'jnr-ffi')
+    runtime.exclude(group: 'com.github.jnr', module: 'jnr-posix')
+}
+
+if (JavaVersion.current().isJava11Compatible()) {
+    dependencies {
+        runtimeOnly(project(':server'))
+    }
+}
+
+jar {
+    doFirst {
+        // Store current Cassandra Sidecar build version in an embedded resource file;
+        // the file is either created or overwritten, and ignored by Git source control
+        Files.createDirectories(Paths.get("$projectDir/server-common/src/main/resources"))
+        new File("$projectDir/server-common/src/main/resources/sidecar.version").text = version
+        println("Created sidecar.version")
+    }
+}
+
+tasks.register('copyIdeaSettings', Copy) {
+    from "ide/idea"
+    into ".idea"
+}
+
+tasks.named('idea').configure {
+    dependsOn copyIdeaSettings
+}
+
+
+// Lets clean distribution directories along with default build directories.
+clean.doLast {
+    println "Deleting generated docs $projectDir/server/src/main/resources/docs"
+    delete "$projectDir/server/src/main/resources/docs"
+}
+
+subprojects {
+    jacocoTestReport {
+        reports {
+            xml.setRequired(true)
+            html.setRequired(true)
+            csv.setRequired(false)
+        }
+    }
+
+    test {
+        finalizedBy jacocoTestReport // report is always generated after tests run
+    }
+
+    tasks.withType(Test).configureEach { testTask ->
+        reports {
+            junitXml.outputLocation.set(rootProject.file("build/test-results/${project.name}/${testTask.name}"))
+            html.outputLocation.set(rootProject.file("build/reports/tests/${project.name}/${testTask.name}"))
+        }
+        testLogging {
+            events "started", "passed", "skipped", "failed"
+            exceptionFormat "full"
+            showExceptions true
+            showCauses true
+            showStackTraces true
+        }
+    }
+}
+
+tasks.register('jacocoRootReport', JacocoReport) {
+    sourceDirectories.from(fileTree(rootDir).include("**/src/main/java/**"))
+    classDirectories.from(fileTree(rootDir).include("**/build/classes/java/main/**"))
+    executionData.from(fileTree(rootDir).include("**/build/jacoco/*.exec"))
+
+    reports {
+        xml.required = true
+        html.required = true
+        csv.required = false
+    }
+}
+
+// copy the user documentation to the final build
+tasks.register('copyDocs', Copy) {
+    dependsOn ':docs:asciidoctor'
+    from(tasks.getByPath(":docs:asciidoctor").outputs) {
+        include "**/*.html"
+    }
+    into "build/docs/"
+    exclude "tmp"
+}
+
+// Exclude some tasks to speed up running ./gradlew run
+if ("run" in gradle.startParameter.taskNames) {
+    project.gradle.startParameter.excludedTaskNames.add("codeCheckTasks")
+    project.gradle.startParameter.excludedTaskNames.add("asciidoctor")
+}
+
+gradle.taskGraph.whenReady { taskGraph ->
+    if ("run" in gradle.startParameter.taskNames) {
+        def exclusionTasks = tasks.findAll {
+            // integration tests
+            it.name == "integrationTest" ||
+            // distribution plugin tasks
+            it.name.startsWith('dist') || it.name.startsWith('assembleDist') ||
+            // tar, deb, zip, rpm tasks
+            it.name.endsWith("Tar") || it.name.endsWith("Deb") || it.name.endsWith("Rpm") || it.name.endsWith("Zip") ||
+            // docs
+            it.name.contains("asciidoctor") || it.name == "copyDocs" ||
+            // other tasks
+            it.name.startsWith("spotbugs") || it.name == "rat"
+        }
+        exclusionTasks.each { task ->
+            task.enabled = false
+            println "Excluding task: ${task.name} because 'run' task is invoked."
+        }
+    }
+}
+
+/**
+ * General configuration for linux packages.
+ * Can be overridden in the buildRpm and buildDeb configuration
+ * We can put dependencies here, such as java, but unfortunately since java is distributed
+ * in an inconsistent manner depending on the version you want (8 vs 11) we can't include Java
+ * as a requirement without the install breaking if you want to use a different version
+ */
+ospackage {
+    packageName = "apache-cassandra-sidecar"
+    version = project.version
+    release = "1"
+    // ospackage puts packages into /opt/[package] by default
+    // which is _technically_ the right spot for packages
+    link("/usr/local/bin/cassandra-sidecar", "/opt/${packageName}/bin/cassandra-sidecar")
+    license = "Apache License 2.0"
+    summary = "Sidecar Management Tool for Apache Cassandra"
+    description = "Sidecar Management Tool for Apache Cassandra"
+    os = LINUX
+    user = "root"
+}
+
+buildRpm {
+    group = "distribution"
+}
+
+buildDeb {
+    group = "distribution"
+}
+
+tasks.register('buildIgnoreRatList', Exec) {
+    description 'Builds a list of ignored files for the rat task from the unversioned git files'
+    commandLine 'bash', '-c', "git clean --force -d --dry-run -x | cut -c 14-"
+    doFirst {
+        mkdir(buildDir)
+        standardOutput new FileOutputStream("${buildDir}/.rat-excludes.txt")
+    }
+    // allows task to fail when git/cut commands are unavailable or fail
+    ignoreExitValue = true
+}
+
+rat {
+    doFirst {
+        def excludeFilePath = Paths.get("${buildDir}/.rat-excludes.txt")
+        def excludeLines = Files.readAllLines(excludeFilePath)
+        excludeLines.each { line ->
+            if (line.endsWith("/")) {
+                excludes.add("**/" + line + "**")
+            } else {
+                excludes.add(line)
+            }
+        }
+    }
+
+    // List of Gradle exclude directives, defaults to ['**/.gradle/**']
+    excludes.add("**/build/**")
+    excludes.add("CHANGES.txt")
+
+    // Documentation files
+    excludes.add("**/docs/src/**")
+    // gradle files
+    excludes.add("gradle/**")
+    excludes.add("gradlew")
+    excludes.add("gradlew.bat")
+
+    // resource files for test
+    excludes.add("**/test**/resources/**")
+
+    // XML, TXT and HTML reports directory, defaults to 'build/reports/rat'
+    reportDir.set(file("build/reports/rat"))
+
+    excludes.add("AGENTS.md")
+    excludes.add("SECURITY.md")
+}
+
+check.dependsOn codeCheckTasks
+if (JavaVersion.current().isJava11Compatible()) {
+    build.dependsOn codeCheckTasks, copyDocs
+}
+run.dependsOn build
+// Ensure OpenAPI spec is generated when running the application
+run.dependsOn ':server:generateOpenApiSpec'
+
+tasks.named('rat').configure {
+    dependsOn(buildIgnoreRatList)
+}
+
+tasks.named('distTar').configure {
+    compression = Compression.GZIP
+    archiveExtension = "tar.gz"
+}
+
+tasks.named('sourcesDistTar').configure {
+    compression = Compression.GZIP
+    archiveExtension = "tar.gz"
+}
+
+signing {
+    required { shouldSign }
+    if (shouldSign) {
+        // Use gpg-agent to sign
+        useGpgCmd()
+    }
+    sign distZip
+    sign distTar
+    sign sourcesDistTar
+    sign buildDeb
+    sign buildRpm
+}
+
+// Generate SHA-256 and SHA-512 checksums for distribution artifacts
+// Required for Apache releases
+tasks.register('generateDistributionChecksums') {
+    description = 'Generates SHA-256 and SHA-512 checksums for distribution artifacts'
+    group = 'distribution'
+
+    dependsOn distTar, distZip, sourcesDistTar, sourcesDistZip, buildDeb, buildRpm
+
+    doLast {
+        println "Generating checksums for distribution archives..."
+        [distTar, distZip, sourcesDistTar, sourcesDistZip, buildDeb, buildRpm].each { task ->
+            def archive = task.archiveFile.get().asFile
+
+            if (archive.exists()) {
+                // Generate SHA-256 checksum
+                def sha256File = new File("${archive}.sha256")
+                def sha256 = java.security.MessageDigest.getInstance("SHA-256")
+                archive.withInputStream { is ->
+                    def buffer = new byte[8192]
+                    int read
+                    while ((read = is.read(buffer)) != -1) {
+                        sha256.update(buffer, 0, read)
+                    }
+                }
+                sha256File.text = sha256.digest().encodeHex().toString() + "  " + archive.name
+
+                // Generate SHA-512 checksum
+                def sha512File = new File("${archive}.sha512")
+                def sha512 = java.security.MessageDigest.getInstance("SHA-512")
+                archive.withInputStream { is ->
+                    def buffer = new byte[8192]
+                    int read
+                    while ((read = is.read(buffer)) != -1) {
+                        sha512.update(buffer, 0, read)
+                    }
+                }
+                sha512File.text = sha512.digest().encodeHex().toString() + "  " + archive.name
+            } else {
+                println "  ✗ Archive not found: ${archive.absolutePath}"
+            }
+        }
+    }
+}
+
+distTar.finalizedBy generateDistributionChecksums
+distZip.finalizedBy generateDistributionChecksums
+sourcesDistTar.finalizedBy generateDistributionChecksums
+sourcesDistZip.finalizedBy generateDistributionChecksums
+assembleDist.finalizedBy generateDistributionChecksums
+assembleSourcesDist.finalizedBy generateDistributionChecksums
+buildDeb.finalizedBy generateDistributionChecksums
+buildRpm.finalizedBy generateDistributionChecksums

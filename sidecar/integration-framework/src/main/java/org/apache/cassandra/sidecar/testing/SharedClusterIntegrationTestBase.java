@@ -1,0 +1,939 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.apache.cassandra.sidecar.testing;
+
+import java.io.IOException;
+import java.net.BindException;
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.net.UnknownHostException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
+
+import com.google.common.util.concurrent.Uninterruptibles;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.TestInstance;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.api.io.TempDir;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.codahale.metrics.MetricRegistry;
+import com.datastax.driver.core.Cluster;
+import com.datastax.driver.core.ResultSet;
+import com.datastax.driver.core.Session;
+import com.datastax.driver.core.SimpleStatement;
+import com.google.inject.AbstractModule;
+import com.google.inject.Guice;
+import com.google.inject.Injector;
+import com.google.inject.Module;
+import com.google.inject.Provides;
+import com.google.inject.Singleton;
+import com.google.inject.util.Modules;
+import io.vertx.core.Handler;
+import io.vertx.core.Vertx;
+import io.vertx.core.eventbus.Message;
+import io.vertx.core.json.JsonObject;
+import io.vertx.junit5.VertxExtension;
+import io.vertx.junit5.VertxTestContext;
+import org.apache.cassandra.distributed.api.ConsistencyLevel;
+import org.apache.cassandra.distributed.api.Feature;
+import org.apache.cassandra.distributed.api.ICluster;
+import org.apache.cassandra.distributed.api.IInstance;
+import org.apache.cassandra.distributed.api.IInstanceConfig;
+import org.apache.cassandra.distributed.shared.JMXUtil;
+import org.apache.cassandra.sidecar.cluster.CassandraAdapterDelegate;
+import org.apache.cassandra.sidecar.cluster.InstancesMetadata;
+import org.apache.cassandra.sidecar.cluster.InstancesMetadataImpl;
+import org.apache.cassandra.sidecar.cluster.instance.InstanceMetadata;
+import org.apache.cassandra.sidecar.cluster.instance.InstanceMetadataImpl;
+import org.apache.cassandra.sidecar.common.server.CQLSessionProvider;
+import org.apache.cassandra.sidecar.common.server.JmxClient;
+import org.apache.cassandra.sidecar.common.server.dns.DnsResolver;
+import org.apache.cassandra.sidecar.common.server.utils.DriverUtils;
+import org.apache.cassandra.sidecar.common.server.utils.SecondBoundConfiguration;
+import org.apache.cassandra.sidecar.common.server.utils.SidecarVersionProvider;
+import org.apache.cassandra.sidecar.common.server.utils.ThrowableUtils;
+import org.apache.cassandra.sidecar.config.JmxConfiguration;
+import org.apache.cassandra.sidecar.config.S3ClientConfiguration;
+import org.apache.cassandra.sidecar.config.S3ProxyConfiguration;
+import org.apache.cassandra.sidecar.config.ServiceConfiguration;
+import org.apache.cassandra.sidecar.config.SidecarConfiguration;
+import org.apache.cassandra.sidecar.config.SslConfiguration;
+import org.apache.cassandra.sidecar.config.yaml.S3ClientConfigurationImpl;
+import org.apache.cassandra.sidecar.config.yaml.SchemaKeyspaceConfigurationImpl;
+import org.apache.cassandra.sidecar.config.yaml.SidecarConfigurationImpl;
+import org.apache.cassandra.sidecar.config.yaml.TestServiceConfiguration;
+import org.apache.cassandra.sidecar.coordination.ClusterLease;
+import org.apache.cassandra.sidecar.lifecycle.InJvmDTestLifecycleProvider;
+import org.apache.cassandra.sidecar.lifecycle.LifecycleProvider;
+import org.apache.cassandra.sidecar.metrics.instance.InstanceHealthMetrics;
+import org.apache.cassandra.sidecar.modules.SidecarModules;
+import org.apache.cassandra.sidecar.server.Server;
+import org.apache.cassandra.sidecar.server.SidecarServerEvents;
+import org.apache.cassandra.sidecar.utils.CassandraVersionProvider;
+import org.apache.cassandra.testing.ClusterBuilderConfiguration;
+import org.apache.cassandra.testing.IClusterExtension;
+import org.apache.cassandra.testing.IsolatedDTestClassLoaderWrapper;
+import org.apache.cassandra.testing.TestUtils;
+import org.apache.cassandra.testing.TestVersion;
+import org.apache.cassandra.testing.TestVersionSupplier;
+
+import static org.apache.cassandra.sidecar.config.yaml.S3ClientConfigurationImpl.DEFAULT_API_CALL_TIMEOUT;
+import static org.apache.cassandra.testing.DriverTestUtils.buildContactPoints;
+import static org.apache.cassandra.testing.utils.IInstanceUtils.tryGetIntConfig;
+import static org.assertj.core.api.Assertions.assertThat;
+
+/**
+ * This class provides an opinionated way to run integration tests. The {@link #setup()} method runs once at the
+ * beginning of all the tests in the implementation, as well as the {@link #tearDown()} method. The tests will share
+ * the same cluster throughout the lifetime of the tests, which means that implementers must be aware that any cluster
+ * alteration will have an impact on subsequent test runs, so it is recommended that tests run in isolated
+ * keyspaces/tables when required. Additionally, the state of the cluster should ideally remain the same for all
+ * tests, so ideally tests should not alter the state of the cluster in a way that would affect other tests.
+ *
+ * <p>The setup will run the following steps:
+ *
+ * <ol>
+ *     <li>Find the first version from the {@link TestVersionSupplier#testVersions()}
+ *     <li>(Optional) Before cluster provisioning (implementer can supply)
+ *     <li>Provision a cluster for the test using the version from the previous step (implementer must supply)
+ *     <li>(Optional) After cluster provisioned (implementer can supply)
+ *     <li>Initialize schemas required for the test (implementer must supply)
+ *     <li>Start sidecar that talks to the provisioned cluster
+ *     <li>(Optional) Run the before test start method (implementer can supply)
+ * </ol>
+ *
+ * <p>The above order guarantees that the cluster and Sidecar are both ready by the time the test
+ * setup completes. Removing the need to wait for schema propagation from the cluster to Sidecar,
+ * and removing the need to poll for schema changes to propagate. This helps in improving test
+ * time.
+ *
+ * <p>For the teardown of the test the steps are the following:
+ *
+ * <ol>
+ *     <li>(Optional) Before sidecar stops (implementer can supply)
+ *     <li>Stop sidecar
+ *     <li>(Optional) Before cluster shutdowns (implementer can supply)
+ *     <li>Close cluster
+ *     <li>(Optional) Before tear down ends (implementer can supply)
+ * </ol>
+ */
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
+@ExtendWith(VertxExtension.class)
+public abstract class SharedClusterIntegrationTestBase
+{
+    protected final Logger logger = LoggerFactory.getLogger(SharedClusterIntegrationTestBase.class);
+    private static final int MAX_CLUSTER_PROVISION_RETRIES = 5;
+    @TempDir
+    static Path secretsPath;
+
+    protected DnsResolver dnsResolver = new LocalhostResolver();
+    protected IClusterExtension<? extends IInstance> cluster;
+    protected ServerWrapper serverWrapper;
+    protected TestVersion testVersion;
+    protected MtlsTestHelper mtlsTestHelper;
+    private IsolatedDTestClassLoaderWrapper classLoaderWrapper;
+
+    static
+    {
+        // Initialize defaults to configure the in-jvm dtest
+        TestUtils.configureDefaultDTestJarProperties();
+    }
+
+    @BeforeAll
+    protected void setup() throws Exception
+    {
+        Optional<TestVersion> maybeTestVersion = TestVersionSupplier.testVersions().findFirst();
+        assertThat(maybeTestVersion).isPresent();
+        this.testVersion = maybeTestVersion.get();
+        logger.info("Testing with version={}", testVersion);
+
+        beforeClusterProvisioning();
+
+        classLoaderWrapper = new IsolatedDTestClassLoaderWrapper();
+        classLoaderWrapper.initializeDTestJarClassLoader(testVersion, TestVersion.class);
+        mtlsTestHelper = new MtlsTestHelper(secretsPath);
+        cluster = provisionClusterWithRetries(this.testVersion);
+        assertThat(cluster).isNotNull();
+        afterClusterProvisioned();
+        initializeSchemaForTest();
+        startSidecar(cluster);
+        beforeTestStart();
+    }
+
+    /**
+     * Provisions a cluster with the provided {@link TestVersion}. Up to {@link #MAX_CLUSTER_PROVISION_RETRIES}
+     * attempts will be made to provision a cluster when it fails to provision.
+     *
+     * @param testVersion the version for the test
+     * @return the provisioned cluster
+     */
+    private IClusterExtension<? extends IInstance> provisionClusterWithRetries(TestVersion testVersion)
+    {
+        for (int retry = 0; retry < MAX_CLUSTER_PROVISION_RETRIES; retry++)
+        {
+            try
+            {
+                return classLoaderWrapper.loadCluster(testVersion.version(), testClusterConfiguration());
+            }
+            catch (RuntimeException runtimeException)
+            {
+                boolean addressAlreadyInUse =
+                ThrowableUtils.getCause(runtimeException, SharedClusterIntegrationTestBase::portNotAvailableToBind) != null;
+                if (addressAlreadyInUse)
+                {
+                    logger.warn("Failed to provision cluster after {} retries", retry, runtimeException);
+                }
+                else
+                {
+                    throw runtimeException;
+                }
+            }
+        }
+        throw new RuntimeException("Unable to provision cluster after " + MAX_CLUSTER_PROVISION_RETRIES + " retries");
+    }
+
+    private static boolean portNotAvailableToBind(Throwable cause)
+    {
+        return (cause instanceof BindException && TestUtils.containsString(cause.getMessage(), "Address already in use")) ||
+               // InboundConnectionInitiator in Cassandra throws a ConfigurationException with this string
+               TestUtils.containsString(cause.getMessage(), "is in use by another process");
+    }
+
+
+    @AfterAll
+    protected void tearDown() throws Exception
+    {
+        try
+        {
+            beforeSidecarStop();
+            stopSidecar();
+            beforeClusterShutdown();
+            closeCluster();
+            afterClusterShutdown();
+        }
+        finally
+        {
+            if (classLoaderWrapper != null)
+            {
+                classLoaderWrapper.closeDTestJarClassLoader();
+            }
+        }
+    }
+
+    /**
+     * Returns the configuration for the test cluster. The default configuration for the cluster has 1
+     * node, 1 DC, 1 data directory per node, with the {@link org.apache.cassandra.distributed.api.Feature#GOSSIP},
+     * {@link org.apache.cassandra.distributed.api.Feature#JMX}, and
+     * {@link org.apache.cassandra.distributed.api.Feature#NATIVE_PROTOCOL} features enabled. It uses dynamic port
+     * allocation for the Cassandra service ports. This method can be overridden to provide a different configuration
+     * for the cluster.
+     *
+     * @return the configuration for the test cluster
+     */
+    protected ClusterBuilderConfiguration testClusterConfiguration()
+    {
+        return new ClusterBuilderConfiguration();
+    }
+
+    /**
+     * Override to perform an action before the cluster provisioning
+     */
+    protected void beforeClusterProvisioning()
+    {
+    }
+
+    /**
+     * Override to perform an action after the cluster has been successfully provisioned
+     */
+    protected void afterClusterProvisioned()
+    {
+    }
+
+    /**
+     * Initialize required schemas for the tests upfront before the test starts
+     */
+    protected abstract void initializeSchemaForTest();
+
+    /**
+     * Override to perform an action before the tests start
+     */
+    protected void beforeTestStart()
+    {
+    }
+
+    /**
+     * Override to perform an action before Sidecar stops
+     */
+    protected void beforeSidecarStop()
+    {
+    }
+
+    /**
+     * Override to perform an action before the cluster stops
+     */
+    protected void beforeClusterShutdown()
+    {
+    }
+
+    /**
+     * Override to perform an action after the cluster has shutdown
+     */
+    protected void afterClusterShutdown()
+    {
+    }
+
+    protected void createTestKeyspace(QualifiedName name, Map<String, Integer> rf)
+    {
+        createTestKeyspace(name.maybeQuotedKeyspace(), rf);
+    }
+
+    protected void createTestKeyspace(Session session, QualifiedName name, Map<String, Integer> rf)
+    {
+        createTestKeyspace(session, name.maybeQuotedKeyspace(), rf);
+    }
+
+    protected void createTestKeyspace(String keyspace, Map<String, Integer> rf)
+    {
+        createTestKeyspace(cluster::schemaChangeIgnoringStoppedInstances, keyspace, rf);
+    }
+
+    protected void createTestKeyspace(Session session, String keyspace, Map<String, Integer> rf)
+    {
+        createTestKeyspace(session::execute, keyspace, rf);
+    }
+
+    protected void createTestKeyspace(Consumer<String> queryExecution, String keyspace, Map<String, Integer> rf)
+    {
+        queryExecution.accept("CREATE KEYSPACE IF NOT EXISTS " + keyspace
+                              + " WITH REPLICATION = { 'class' : 'NetworkTopologyStrategy', " +
+                              generateRfString(rf) + " };");
+    }
+
+    protected void createTestTable(QualifiedName name, String createTableStatement)
+    {
+        createTestTable(cluster::schemaChangeIgnoringStoppedInstances, name, createTableStatement);
+    }
+
+    protected void createTestTable(Session session, QualifiedName name, String createTableStatement)
+    {
+        createTestTable(session::execute, name, createTableStatement);
+    }
+
+    protected void createTestTable(Consumer<String> queryExecution, QualifiedName name, String createTableStatement)
+    {
+        queryExecution.accept(String.format(createTableStatement, name));
+    }
+
+    /**
+     * Override to provide additional options to configure sidecar
+     *
+     * @return function to update {@link SidecarConfigurationImpl.Builder}
+     */
+    protected Function<SidecarConfigurationImpl.Builder, SidecarConfigurationImpl.Builder> configurationOverrides()
+    {
+        return null;
+    }
+
+    /**
+     * Starts Sidecar configured to run against the provided Cassandra {@code cluster}.
+     *
+     * @param cluster the cluster to use
+     * @throws InterruptedException when the startup times out
+     */
+    protected void startSidecar(ICluster<? extends IInstance> cluster) throws InterruptedException
+    {
+        serverWrapper = startSidecarWithInstances(cluster);
+    }
+
+    /**
+     * Starts Sidecar configured to run with the provided {@link IInstance}s from the cluster.
+     *
+     * @param instances the Cassandra instances Sidecar will manage
+     * @return a wrapper with the started server
+     * @throws InterruptedException when the server start operation is interrupted
+     */
+    protected ServerWrapper startSidecarWithInstances(Iterable<? extends IInstance> instances) throws InterruptedException
+    {
+        return startSidecarWithInstances(instances, null);
+    }
+
+    /**
+     * Starts Sidecar configured to run with the provided {@link IInstance}s from the cluster.
+     *
+     * @param instances    the Cassandra instances Sidecar will manage
+     * @param customModule an optional custom module that overrides during injection
+     * @return the started server
+     * @throws InterruptedException when the server start operation is interrupted
+     */
+    protected ServerWrapper startSidecarWithInstances(Iterable<? extends IInstance> instances, AbstractModule customModule) throws InterruptedException
+    {
+        VertxTestContext context = new VertxTestContext();
+        AbstractModule testModule = new IntegrationTestModule(instances, mtlsTestHelper,
+                                                              dnsResolver, configurationOverrides());
+        Module module = testModule;
+        if (customModule != null)
+        {
+            module = Modules.override(testModule).with(customModule);
+        }
+        Injector injector = Guice.createInjector(Modules.override(SidecarModules.all()).with(module));
+        Server sidecarServer = injector.getInstance(Server.class);
+        sidecarServer.start()
+                     .onSuccess(s -> context.completeNow())
+                     .onFailure(context::failNow);
+
+        assertThat(context.awaitCompletion(5, TimeUnit.SECONDS)).isTrue();
+        return new ServerWrapper(injector, sidecarServer);
+    }
+
+    protected void waitForSchemaReady(long timeout, TimeUnit timeUnit)
+    {
+        waitForSchemaReady(serverWrapper, timeout, timeUnit);
+    }
+
+    protected void waitForSchemaReady(ServerWrapper serverWrapper, long timeout, TimeUnit timeUnit)
+    {
+        assertThat(serverWrapper)
+        .describedAs("Sidecar should be started")
+        .isNotNull();
+
+        assertThat(Uninterruptibles.awaitUninterruptibly(serverWrapper.sidecarSchemaReadyLatch, timeout, timeUnit))
+        .describedAs("Sidecar schema is not initialized after " + timeout + ' ' + timeUnit)
+        .isTrue();
+    }
+
+    /**
+     * Polls a condition until it returns true or timeout is reached.
+     * Uses System.nanoTime() for accurate timing and Uninterruptibles for consistent sleep behavior.
+     *
+     * @param condition the condition to check
+     * @param timeoutSeconds maximum time to wait in seconds
+     * @param pollIntervalMillis interval between checks in milliseconds
+     * @throws AssertionError if timeout is reached before condition is met
+     */
+    protected void waitUntil(BooleanSupplier condition, long timeoutSeconds, long pollIntervalMillis)
+    {
+        long startTime = System.nanoTime();
+        long timeoutNanos = TimeUnit.SECONDS.toNanos(timeoutSeconds);
+
+        while (!condition.getAsBoolean())
+        {
+            if (System.nanoTime() - startTime > timeoutNanos)
+            {
+                throw new AssertionError("Condition not met within " + timeoutSeconds + " seconds");
+            }
+            Uninterruptibles.sleepUninterruptibly(pollIntervalMillis, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /**
+     * Stops the Sidecar service
+     *
+     * @throws InterruptedException when stopping sidecar times out
+     */
+    protected void stopSidecar() throws InterruptedException
+    {
+        if (serverWrapper == null)
+        {
+            return;
+        }
+        closeServer(serverWrapper);
+    }
+
+    protected void closeServer(ServerWrapper wrapper) throws InterruptedException
+    {
+        if (wrapper == null)
+        {
+            return;
+        }
+        CountDownLatch closeLatch = new CountDownLatch(1);
+        wrapper.server.close().onSuccess(res -> closeLatch.countDown());
+        if (closeLatch.await(60, TimeUnit.SECONDS))
+        {
+            logger.info("Close event received before timeout.");
+        }
+        else
+        {
+            logger.error("Close event timed out.");
+        }
+    }
+
+    /**
+     * Closes the cluster and its resources
+     *
+     * @throws Exception on an exception generated during cluster shutdown
+     */
+    protected void closeCluster() throws Exception
+    {
+        if (cluster == null)
+        {
+            return;
+        }
+        logger.info("Closing cluster={}", cluster);
+        try
+        {
+            cluster.close();
+        }
+        // ShutdownException may be thrown from a different classloader, and therefore the standard
+        // `catch (ShutdownException)` won't always work - compare the canonical names instead.
+        catch (Throwable t)
+        {
+            if (Objects.equals(t.getClass().getCanonicalName(),
+                               "org.apache.cassandra.distributed.shared.ShutdownException"))
+            {
+                logger.debug("Encountered shutdown exception which closing the cluster", t);
+            }
+            else
+            {
+                throw t;
+            }
+        }
+    }
+
+    protected String generateRfString(Map<String, Integer> rf)
+    {
+        return rf.entrySet()
+                 .stream()
+                 .map(entry -> String.format("'%s':%d", entry.getKey(), entry.getValue()))
+                 .collect(Collectors.joining(","));
+    }
+
+    /**
+     * Convenience method to query all data from the provided {@code table} at consistency level {@code LOCAL_QUORUM}.
+     *
+     * @param table the qualified Cassandra table name
+     * @return all the data queried from the table
+     */
+    protected Object[][] queryAllData(QualifiedName table)
+    {
+        return queryAllData(table, ConsistencyLevel.LOCAL_QUORUM);
+    }
+
+    /**
+     * Convenience method to query all data from the provided {@code table} at the specified consistency level.
+     *
+     * @param table            the qualified Cassandra table name
+     * @param consistencyLevel the consistency level to use for querying the data
+     * @return all the data queried from the table
+     */
+    protected Object[][] queryAllData(QualifiedName table, ConsistencyLevel consistencyLevel)
+    {
+        return cluster.getFirstRunningInstance()
+                      .coordinator()
+                      .execute(String.format("SELECT * FROM %s;", table), consistencyLevel);
+    }
+
+    /**
+     * Convenience method to query all data from the provided {@code table} at consistency level ALL.
+     *
+     * @param table the qualified Cassandra table name
+     * @return all the data queried from the table
+     */
+    protected ResultSet queryAllDataWithDriver(QualifiedName table)
+    {
+        return queryAllDataWithDriver(table, ConsistencyLevel.ALL);
+    }
+
+    /**
+     * Convenience method to query all data from the provided {@code table} at the specified consistency level.
+     *
+     * @param table       the qualified Cassandra table name
+     * @param consistency the consistency level to use for querying the data
+     * @return all the data queried from the table
+     */
+    protected ResultSet queryAllDataWithDriver(QualifiedName table, ConsistencyLevel consistency)
+    {
+        Cluster driverCluster = createDriverCluster(cluster.delegate());
+        Session session = driverCluster.connect();
+        SimpleStatement statement = new SimpleStatement(String.format("SELECT * FROM %s;", table));
+        statement.setConsistencyLevel(com.datastax.driver.core.ConsistencyLevel.valueOf(consistency.name()));
+        return session.execute(statement);
+    }
+
+    // Utility methods
+
+    public static Cluster createDriverCluster(ICluster<? extends IInstance> dtest)
+    {
+        return createDriverCluster(dtest, null);
+    }
+
+    public static Cluster createDriverCluster(ICluster<? extends IInstance> dtest, Consumer<com.datastax.driver.core.Cluster.Builder> overrideBuilder)
+    {
+        dtest.stream().forEach((i) -> {
+            if (!i.config().has(Feature.NATIVE_PROTOCOL) || !i.config().has(Feature.GOSSIP))
+            {
+                throw new IllegalStateException("Java driver requires Feature.NATIVE_PROTOCOL and Feature.GOSSIP; " +
+                                                "but one or more is missing");
+            }
+        });
+        Cluster.Builder builder = Cluster.builder()
+                                         .withoutMetrics();
+        dtest.stream().forEach((i) -> {
+            InetSocketAddress address = new InetSocketAddress(i.broadcastAddress().getAddress(),
+                                                              i.config().getInt("native_transport_port"));
+            builder.addContactPointsWithPorts(address);
+        });
+        if (overrideBuilder != null)
+        {
+            overrideBuilder.accept(builder);
+        }
+        return builder.build();
+    }
+
+    /**
+     * Recursively searches for files or directories matching the target name within the given keyspace.
+     * Note: must disable compaction, otherwise the file tree can be mutated while walking and test becomes flaky.
+     * Append WITH_COMPACTION_DISABLED to the table create statement.
+     *
+     * @param hostname     the hostname of the instance
+     * @param keyspaceName the keyspace name
+     * @param target       the target file or directory name to find
+     * @return a list of paths that match the target
+     */
+    protected List<Path> findChildFile(String hostname, String keyspaceName, String target)
+    {
+        InstanceMetadata instance = serverWrapper.injector.getInstance(InstancesMetadata.class).instanceFromHost(hostname);
+        List<String> dataDirs = instance.dataDirs();
+
+        return dataDirs.stream()
+                       .flatMap(dir -> findChildFile(Paths.get(dir, keyspaceName), target).stream())
+                       .collect(Collectors.toList());
+    }
+
+    /**
+     * Recursively searches for files or directories matching the target name within the given path.
+     *
+     * @param path   the root path to search from
+     * @param target the target file or directory name to find
+     * @return a list of paths that match the target
+     */
+    private List<Path> findChildFile(Path path, String target)
+    {
+        try (Stream<Path> walkStream = Files.walk(path))
+        {
+            return walkStream.filter(p -> p.toString().endsWith(target)
+                                          || p.toString().contains("/" + target + "/"))
+                             .collect(Collectors.toList());
+        }
+        catch (IOException e)
+        {
+            return Collections.emptyList();
+        }
+    }
+
+    /**
+     * Wraps the Sidecar server and keeps a reference to the injector to be able to dynamically retrieve
+     * objects for testing purposes
+     */
+    public static class ServerWrapper
+    {
+        public final Injector injector;
+        public final Server server;
+        private final InstancesMetadata instancesMetadata;
+        public volatile int serverPort;
+        private final CountDownLatch sidecarSchemaReadyLatch = new CountDownLatch(1);
+        private final Set<String> upNodes = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+
+        public ServerWrapper(Injector sidecarServerInjector, Server server)
+        {
+            this.injector = sidecarServerInjector;
+            this.server = server;
+            // Server must have started to retrieve the port
+            this.serverPort = server.actualPort();
+            this.instancesMetadata = injector.getInstance(InstancesMetadata.class);
+
+            Vertx vertx = sidecarServerInjector.getInstance(Vertx.class);
+            vertx.eventBus().localConsumer(SidecarServerEvents.ON_SIDECAR_SCHEMA_INITIALIZED.address(),
+                                           msg -> sidecarSchemaReadyLatch.countDown());
+            vertx.eventBus().localConsumer(SidecarServerEvents.ON_CASSANDRA_CQL_READY.address(),
+                                           cqlUpHandler());
+            vertx.eventBus().localConsumer(SidecarServerEvents.ON_CASSANDRA_CQL_DISCONNECTED.address(),
+                                           cqlDownHandler());
+        }
+
+        public Handler<Message<JsonObject>> cqlUpHandler()
+        {
+            return message -> {
+                Integer instanceId = message.body().getInteger("cassandraInstanceId");
+                String hostname = instancesMetadata.instanceFromId(instanceId).host();
+                upNodes.add(hostname);
+            };
+        }
+
+        public Handler<Message<JsonObject>> cqlDownHandler()
+        {
+            return message -> {
+                Integer instanceId = message.body().getInteger("cassandraInstanceId");
+                String hostname = instancesMetadata.instanceFromId(instanceId).host();
+                upNodes.remove(hostname);
+            };
+        }
+    }
+
+    /**
+     * Test module that configures the instances based on the cluster instances
+     */
+    public static class IntegrationTestModule extends AbstractModule
+    {
+        private static final Logger LOGGER = LoggerFactory.getLogger(IntegrationTestModule.class);
+        private final Iterable<? extends IInstance> instances;
+        private final MtlsTestHelper mtlsTestHelper;
+        private final DnsResolver dnsResolver;
+        private final SidecarVersionProvider sidecarVersionProvider = new SidecarVersionProvider();
+        private final Function<SidecarConfigurationImpl.Builder, SidecarConfigurationImpl.Builder> configurationOverrides;
+
+        public IntegrationTestModule(Iterable<? extends IInstance> instances,
+                                     MtlsTestHelper mtlsTestHelper,
+                                     DnsResolver dnsResolver,
+                                     Function<SidecarConfigurationImpl.Builder, SidecarConfigurationImpl.Builder> configurationOverrides)
+        {
+            this.instances = instances;
+            this.mtlsTestHelper = mtlsTestHelper;
+            this.configurationOverrides = configurationOverrides;
+            this.dnsResolver = dnsResolver;
+        }
+
+        @Provides
+        @Singleton
+        public CQLSessionProvider cqlSessionProvider()
+        {
+            List<InetSocketAddress> contactPoints = buildContactPoints(instances);
+            return new TemporaryCqlSessionProvider(contactPoints,
+                                                   SharedExecutorNettyOptions.INSTANCE);
+        }
+
+        @Provides
+        @Singleton
+        public SidecarVersionProvider sidecarVersionProvider()
+        {
+            return sidecarVersionProvider;
+        }
+
+        @Provides
+        @Singleton
+        public InstancesMetadata instancesMetadata(Vertx vertx,
+                                                   SidecarConfiguration configuration,
+                                                   CassandraVersionProvider cassandraVersionProvider,
+                                                   SidecarVersionProvider sidecarVersionProvider,
+                                                   CQLSessionProvider cqlSessionProvider,
+                                                   DnsResolver dnsResolver)
+        {
+            JmxConfiguration jmxConfiguration = configuration.serviceConfiguration().jmxConfiguration();
+            List<InstanceMetadata> instanceMetadataList =
+            StreamSupport.stream(instances.spliterator(), false)
+                         .map(instance -> buildInstanceMetadata(vertx,
+                                                                instance,
+                                                                cassandraVersionProvider,
+                                                                sidecarVersionProvider.sidecarVersion(),
+                                                                jmxConfiguration,
+                                                                cqlSessionProvider,
+                                                                dnsResolver))
+                         .collect(Collectors.toList());
+            return new InstancesMetadataImpl(instanceMetadataList, dnsResolver);
+        }
+
+        @Provides
+        @Singleton
+        public SidecarConfiguration sidecarConfiguration()
+        {
+            return defaultConfigurationBuilder(mtlsTestHelper, configurationOverrides).build();
+        }
+
+        @Provides
+        @Singleton
+        public DnsResolver dnsResolver()
+        {
+            return dnsResolver;
+        }
+
+        @Provides
+        @Singleton
+        public ClusterLease clusterLease()
+        {
+            return new ClusterLease(ClusterLease.Ownership.CLAIMED);
+        }
+
+        @Provides
+        @Singleton
+        public LifecycleProvider lifecycleProvider()
+        {
+            return new InJvmDTestLifecycleProvider(instances);
+        }
+
+        public static SidecarConfigurationImpl.Builder defaultConfigurationBuilder(
+                MtlsTestHelper mtlsTestHelper,
+                Function<SidecarConfigurationImpl.Builder, SidecarConfigurationImpl.Builder> configurationOverrides)
+        {
+            ServiceConfiguration conf = TestServiceConfiguration.builder()
+                                                                .schemaKeyspaceConfiguration(SchemaKeyspaceConfigurationImpl.builder()
+                                                                                                                            .isEnabled(true)
+                                                                                                                            .build())
+                                                                .build();
+
+            SslConfiguration sslConfiguration = mtlsTestHelper.createServerSslConfiguration();
+            S3ClientConfiguration s3ClientConfig =
+            new S3ClientConfigurationImpl("s3-client",
+                                          4,
+                                          SecondBoundConfiguration.parse("60s"),
+                                          5242880,
+                                          DEFAULT_API_CALL_TIMEOUT,
+                                          buildTestS3ProxyConfig());
+
+            SidecarConfigurationImpl.Builder builder = SidecarConfigurationImpl.builder()
+                                                                               .serviceConfiguration(conf)
+                                                                               .s3ClientConfiguration(s3ClientConfig)
+                                                                               .sslConfiguration(sslConfiguration);
+            if (configurationOverrides != null)
+            {
+                builder = configurationOverrides.apply(builder);
+            }
+            return builder;
+        }
+
+        private static S3ProxyConfiguration buildTestS3ProxyConfig()
+        {
+            return new S3ProxyConfiguration()
+            {
+                @Override
+                public URI proxy()
+                {
+                    return null;
+                }
+
+                @Override
+                public String username()
+                {
+                    return null;
+                }
+
+                @Override
+                public String password()
+                {
+                    return null;
+                }
+
+                @Override
+                public URI endpointOverride()
+                {
+                    return URI.create("http://localhost:9090");
+                }
+            };
+        }
+
+        public static String cassandraInstanceHostname(IInstance cassandraInstance, DnsResolver dnsResolver)
+        {
+            IInstanceConfig config = cassandraInstance.config();
+            String ipAddress = JMXUtil.getJmxHost(config);
+            try
+            {
+                return dnsResolver.reverseResolve(ipAddress);
+            }
+            catch (UnknownHostException e)
+            {
+                return ipAddress;
+            }
+        }
+
+        static InstanceMetadata buildInstanceMetadata(Vertx vertx,
+                                                      IInstance cassandraInstance,
+                                                      CassandraVersionProvider versionProvider,
+                                                      String sidecarVersion,
+                                                      JmxConfiguration jmxConfiguration,
+                                                      CQLSessionProvider session,
+                                                      DnsResolver dnsResolver)
+        {
+            IInstanceConfig config = cassandraInstance.config();
+            String ipAddress = JMXUtil.getJmxHost(config);
+            String hostName;
+            try
+            {
+                hostName = dnsResolver.reverseResolve(ipAddress);
+            }
+            catch (UnknownHostException e)
+            {
+                hostName = ipAddress;
+            }
+            int port = tryGetIntConfig(config, "native_transport_port", 9042);
+            int storagePort = tryGetIntConfig(config, "storage_port", 7000);
+            String[] dataDirectories = (String[]) config.get("data_file_directories");
+            String stagingDir = stagingDir(dataDirectories);
+
+            JmxClient jmxClient = JmxClient.builder()
+                                           .host(ipAddress)
+                                           .port(config.jmxPort())
+                                           .connectionMaxRetries(jmxConfiguration.maxRetries())
+                                           .connectionRetryDelay(jmxConfiguration.retryDelay())
+                                           .build();
+            MetricRegistry metricRegistry = new MetricRegistry();
+            CassandraAdapterDelegate delegate = new CassandraAdapterDelegate(vertx,
+                                                                             config.num(),
+                                                                             versionProvider,
+                                                                             session,
+                                                                             jmxClient,
+                                                                             new DriverUtils(),
+                                                                             sidecarVersion,
+                                                                             ipAddress,
+                                                                             port,
+                                                                             new InstanceHealthMetrics(metricRegistry));
+            return InstanceMetadataImpl.builder()
+                                       .id(config.num())
+                                       .host(hostName)
+                                       .port(port)
+                                       .storagePort(storagePort)
+                                       .dataDirs(List.of(dataDirectories))
+                                       .cdcDir(config.getString("cdc_raw_directory"))
+                                       .commitlogDir(config.getString("commitlog_directory"))
+                                       .hintsDir(config.getString("hints_directory"))
+                                       .savedCachesDir(config.getString("saved_caches_directory"))
+                                       .stagingDir(stagingDir)
+                                       .delegate(delegate)
+                                       .metricRegistry(metricRegistry)
+                                       .build();
+        }
+
+        private static String stagingDir(String[] dataDirectories)
+        {
+            // Use the parent of the first data directory as the staging directory
+            Path dataDirParentPath = Paths.get(dataDirectories[0]).getParent();
+            // If the cluster has not started yet, the node's root directory doesn't exist yet
+            assertThat(dataDirParentPath).isNotNull();
+            Path stagingPath = dataDirParentPath.resolve("staging");
+            return stagingPath.toFile().getAbsolutePath();
+        }
+    }
+}
