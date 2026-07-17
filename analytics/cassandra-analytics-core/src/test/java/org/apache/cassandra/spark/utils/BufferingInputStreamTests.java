@@ -1,0 +1,470 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.apache.cassandra.spark.utils;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+import com.google.common.collect.ImmutableList;
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import com.google.common.util.concurrent.Uninterruptibles;
+import org.junit.jupiter.api.Test;
+
+import org.apache.cassandra.analytics.stats.Stats;
+import org.apache.cassandra.spark.data.FileType;
+import org.apache.cassandra.spark.data.SSTable;
+import org.apache.cassandra.spark.utils.streaming.BufferingInputStream;
+import org.apache.cassandra.spark.utils.streaming.CassandraFileSource;
+import org.apache.cassandra.spark.utils.streaming.StreamBuffer;
+import org.apache.cassandra.spark.utils.streaming.StreamConsumer;
+import org.jetbrains.annotations.Nullable;
+
+import static org.apache.cassandra.spark.utils.streaming.BufferingInputStream.timeoutLeftNanos;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.fail;
+
+/**
+ * Test the {@link BufferingInputStream} by mocking the {@link CassandraFileSource}
+ */
+public class BufferingInputStreamTests
+{
+    private static final ScheduledExecutorService SCHEDULER = Executors.newScheduledThreadPool(1);
+    private static final ExecutorService EXECUTOR =
+    Executors.newFixedThreadPool(4, new ThreadFactoryBuilder().setNameFormat("sstable-tests-%d")
+                                                              .setDaemon(true)
+                                                              .build());
+    static final int DEFAULT_CHUNK_SIZE = 8192;
+    static final Stats STATS = Stats.DoNothingStats.INSTANCE;
+
+    // Mocked Tests
+
+    @Test
+    public void testMockedClient() throws IOException
+    {
+        runMockedTest(1, 1, DEFAULT_CHUNK_SIZE);
+        runMockedTest(1, 5, DEFAULT_CHUNK_SIZE * 5);
+        runMockedTest(10, 10, CassandraFileSource.DEFAULT_MAX_BUFFER_SIZE);
+        runMockedTest(20, 1024, 33554400L);
+        runMockedTest(10, 10, DEFAULT_CHUNK_SIZE * 10);
+    }
+
+    private interface SSTableRequest
+    {
+        void request(long start, long end, StreamConsumer consumer);
+    }
+
+    private static CassandraFileSource<SSTable> buildSource(long size,
+                                                            Long maxBufferSize,
+                                                            Long requestChunkSize,
+                                                            SSTableRequest request,
+                                                            Duration duration)
+    {
+        return new CassandraFileSource<SSTable>()
+        {
+            public void request(long start, long end, StreamConsumer consumer)
+            {
+                request.request(start, end, consumer);
+            }
+
+            public SSTable cassandraFile()
+            {
+                return null;
+            }
+
+            public FileType fileType()
+            {
+                return null;
+            }
+
+            public long size()
+            {
+                return size;
+            }
+
+            public long maxBufferSize()
+            {
+                return maxBufferSize != null ? maxBufferSize : CassandraFileSource.DEFAULT_MAX_BUFFER_SIZE;
+            }
+
+            public long chunkBufferSize()
+            {
+                return requestChunkSize != null ? requestChunkSize : CassandraFileSource.DEFAULT_CHUNK_BUFFER_SIZE;
+            }
+
+            public Duration timeout()
+            {
+                return duration;
+            }
+        };
+    }
+
+    // Test BufferingInputStream using mocked CassandraFileSource
+    private void runMockedTest(int numRequests, int chunksPerRequest, long maxBufferSize) throws IOException
+    {
+        long requestChunkSize = (long) DEFAULT_CHUNK_SIZE * chunksPerRequest;
+        long fileSize = requestChunkSize * (long) numRequests;
+        AtomicInteger requestCount = new AtomicInteger(0);
+        CassandraFileSource<SSTable> mockedClient = buildSource(fileSize,
+                                                                maxBufferSize,
+                                                                requestChunkSize,
+                                                                (start, end, consumer) -> {
+                                                                    requestCount.incrementAndGet();
+                                                                    writeBuffers(consumer, randomBuffers(chunksPerRequest));
+                                                                }, null);
+        BufferingInputStream<SSTable> is = new BufferingInputStream<>(mockedClient, STATS.bufferingInputStreamStats());
+        readStreamFully(is);
+        assertThat(requestCount.get()).isEqualTo(numRequests);
+        assertThat(is.bytesBuffered()).isEqualTo(0L);
+        assertThat(is.bytesWritten()).isEqualTo(fileSize);
+        assertThat(is.bytesRead()).isEqualTo(fileSize);
+    }
+
+    @Test()
+    public void testFailure()
+    {
+        int chunksPerRequest = 10;
+        int numRequests = 10;
+        long length = CassandraFileSource.DEFAULT_CHUNK_BUFFER_SIZE * chunksPerRequest * numRequests;
+        AtomicInteger count = new AtomicInteger(0);
+        CassandraFileSource<SSTable> source = buildSource(length,
+                                                          CassandraFileSource.DEFAULT_MAX_BUFFER_SIZE,
+                                                          CassandraFileSource.DEFAULT_CHUNK_BUFFER_SIZE,
+                                                          (start, end, consumer) -> {
+                                                              if (count.incrementAndGet() > (numRequests / 2))
+                                                              {
+                                                                  // Halfway through throw random exception
+                                                                  EXECUTOR.submit(() -> consumer.onError(new RuntimeException("Something bad happened...")));
+                                                              }
+                                                              else
+                                                              {
+                                                                  writeBuffers(consumer, randomBuffers(chunksPerRequest));
+                                                              }
+                                                          }, null);
+        assertThatThrownBy(() -> readStreamFully(new BufferingInputStream<>(source, STATS.bufferingInputStreamStats())))
+        .isInstanceOf(IOException.class);
+    }
+
+    @Test
+    public void testTimeout()
+    {
+        long now = System.nanoTime();
+        assertThat(timeoutLeftNanos(Duration.ofMillis(1000), now, now - Duration.ofMillis(900).toNanos()))
+        .isEqualTo(Duration.ofMillis(100).toNanos());
+        assertThat(timeoutLeftNanos(Duration.ofMillis(1000), now, now - Duration.ofMillis(1500).toNanos()))
+        .isEqualTo(Duration.ofMillis(-500).toNanos());
+        assertThat(timeoutLeftNanos(Duration.ofMillis(1000), now, now - Duration.ofMillis(5).toNanos()))
+        .isEqualTo(Duration.ofMillis(995).toNanos());
+        assertThat(timeoutLeftNanos(Duration.ofMillis(1000), now, now - Duration.ofMillis(0).toNanos()))
+        .isEqualTo(Duration.ofMillis(1000).toNanos());
+        assertThat(timeoutLeftNanos(Duration.ofMillis(1000), now, now + Duration.ofMillis(500).toNanos()))
+        .isEqualTo(Duration.ofMillis(1000).toNanos());
+        assertThat(timeoutLeftNanos(Duration.ofMillis(60000), now, now - Duration.ofMillis(25000).toNanos()))
+        .isEqualTo(Duration.ofMillis(35000).toNanos());
+        assertThat(timeoutLeftNanos(Duration.ofMillis(60000), now, now - Duration.ofMillis(65000).toNanos()))
+        .isEqualTo(Duration.ofMillis(-5000).toNanos());
+        assertThat(timeoutLeftNanos(Duration.ofMillis(60000), now, now - Duration.ofMillis(60000).toNanos()))
+        .isEqualTo(Duration.ofMillis(0).toNanos());
+    }
+
+    @Test
+    @SuppressWarnings("UnstableApiUsage")
+    public void testTimeoutShouldAccountForActivityTime()
+    {
+        int chunksPerRequest = 10;
+        int numRequests = 10;
+        long length = CassandraFileSource.DEFAULT_CHUNK_BUFFER_SIZE * chunksPerRequest * numRequests;
+        AtomicInteger count = new AtomicInteger(0);
+        Duration timeout = Duration.ofMillis(1000);
+        long startTime = System.nanoTime();
+        long sleepTimeInMillis = 100L;
+        CassandraFileSource<SSTable> source = buildSource(length,
+                                                          CassandraFileSource.DEFAULT_MAX_BUFFER_SIZE,
+                                                          CassandraFileSource.DEFAULT_CHUNK_BUFFER_SIZE,
+                                                          (start, end, consumer) -> {
+                                                              // Only respond once so future requests will time out
+                                                              if (count.incrementAndGet() == 1)
+                                                              {
+                                                                  EXECUTOR.submit(() -> {
+                                                                      Uninterruptibles.sleepUninterruptibly(sleepTimeInMillis, TimeUnit.MILLISECONDS);
+                                                                      writeBuffers(consumer, randomBuffers(chunksPerRequest));
+                                                                  });
+                                                              }
+                                                          }, timeout);
+        BufferingInputStream<SSTable> inputStream = new BufferingInputStream<>(source, STATS.bufferingInputStreamStats());
+        try
+        {
+            readStreamFully(inputStream);
+            fail("Should not reach here, should throw TimeoutException");
+        }
+        catch (IOException exception)
+        {
+            assertThat(exception.getCause()).isInstanceOf(TimeoutException.class);
+        }
+        long readAndTimeoutTotal = TimeUnit.NANOSECONDS.toMillis(inputStream.timeBlockedNanos()) + timeout.toMillis();
+        Duration clientTimeoutTotal = Duration.ofNanos(System.nanoTime() - startTime);
+        assertThat(clientTimeoutTotal.toMillis()).isGreaterThanOrEqualTo(readAndTimeoutTotal)
+                                                 .describedAs("Timeout didn't account for activity time. "
+                                                              + "Took %dms should have taken at least %dms",
+                                                              clientTimeoutTotal.toMillis(), readAndTimeoutTotal);
+    }
+
+    @Test
+    public void testSkipOnInit() throws IOException
+    {
+        int size = 20971520;
+        int chunkSize = 1024;
+        int numChunks = 16;
+        AtomicInteger bytesRead = new AtomicInteger(0);
+        AtomicInteger count = new AtomicInteger(0);
+        CassandraFileSource<SSTable> source = new CassandraFileSource<SSTable>()
+        {
+            @Override
+            public void request(long start, long end, StreamConsumer consumer)
+            {
+                assertThat(start).isNotEqualTo(0);
+                int length = (int) (end - start + 1);
+                consumer.onRead(randomBuffer(length));
+                bytesRead.addAndGet(length);
+                count.incrementAndGet();
+                consumer.onEnd();
+            }
+
+            @Override
+            public long chunkBufferSize()
+            {
+                return chunkSize;
+            }
+
+            @Override
+            public SSTable cassandraFile()
+            {
+                return null;
+            }
+
+            @Override
+            public FileType fileType()
+            {
+                return FileType.INDEX;
+            }
+
+            @Override
+            public long size()
+            {
+                return size;
+            }
+
+            @Override
+            @Nullable
+            public Duration timeout()
+            {
+                return Duration.ofSeconds(5);
+            }
+        };
+
+        int bytesToRead = chunkSize * numChunks;
+        long skipAhead = size - bytesToRead;
+        try (BufferingInputStream<SSTable> stream = new BufferingInputStream<>(source, STATS.bufferingInputStreamStats()))
+        {
+            // Skip ahead so we only read the final chunks
+            ByteBufferUtils.skipFully(stream, skipAhead);
+            readStreamFully(stream);
+        }
+        // Verify we only read final chunks and not the start of the file
+        assertThat(bytesRead.intValue()).isEqualTo(bytesToRead);
+        assertThat(count.intValue()).isEqualTo(numChunks);
+    }
+
+    @Test
+    public void testSkipToEnd() throws IOException
+    {
+        CassandraFileSource<SSTable> source = new CassandraFileSource<SSTable>()
+        {
+            @Override
+            public void request(long start, long end, StreamConsumer consumer)
+            {
+                consumer.onRead(randomBuffer((int) (end - start + 1)));
+                consumer.onEnd();
+            }
+
+            @Override
+            public SSTable cassandraFile()
+            {
+                return null;
+            }
+
+            @Override
+            public FileType fileType()
+            {
+                return FileType.INDEX;
+            }
+
+            @Override
+            public long size()
+            {
+                return 20971520;
+            }
+
+            @Override
+            @Nullable
+            public Duration timeout()
+            {
+                return Duration.ofSeconds(5);
+            }
+        };
+
+        try (BufferingInputStream<SSTable> stream = new BufferingInputStream<>(source, STATS.bufferingInputStreamStats()))
+        {
+            ByteBufferUtils.skipFully(stream, 20971520);
+            readStreamFully(stream);
+        }
+    }
+
+    @Test
+    public void testUnalignedEndReading() throws IOException
+    {
+        int dataSize = 8192;
+        int chunkSize = 4096;
+        int remainingReadBytes = 2;
+        List<byte[]> returnedBuffers = new ArrayList<>();
+        CassandraFileSource<SSTable> source = new CassandraFileSource<SSTable>()
+        {
+            @Override
+            public void request(long start, long end, StreamConsumer consumer)
+            {
+                byte[] bytes = RandomUtils.randomBytes((int) (end - start + 1));
+                StreamBuffer buffer = StreamBuffer.wrap(bytes);
+                returnedBuffers.add(bytes);
+                consumer.onRead(buffer);
+                consumer.onEnd();
+            }
+
+            @Override
+            public SSTable cassandraFile()
+            {
+                return null;
+            }
+
+            @Override
+            public FileType fileType()
+            {
+                return FileType.PARTITIONS_INDEX;
+            }
+
+            @Override
+            public long size()
+            {
+                return dataSize;
+            }
+
+            @Override
+            @Nullable
+            public Duration timeout()
+            {
+                return Duration.ofSeconds(5);
+            }
+
+            @Override
+            public long chunkBufferSize()
+            {
+                return chunkSize;
+            }
+        };
+
+        try (BufferingInputStream<SSTable> stream1 = new BufferingInputStream<>(source, STATS.bufferingInputStreamStats()))
+        {
+            // move left from the file end by (chunkSize + remainingReadBytes)
+            try (BufferingInputStream<SSTable> stream2 = stream1.reBuffer(dataSize - chunkSize - remainingReadBytes))
+            {
+                ByteBuffer buffer = ByteBuffer.allocate(chunkSize);
+                int read = stream2.read(buffer); // read last full chunk
+                assertThat(returnedBuffers).hasSize(2);
+                assertThat(read).isEqualTo(chunkSize);
+                assertThat(buffer.array()).isEqualTo(returnedBuffers.get(0));
+
+                buffer.position(0);
+                buffer.limit(remainingReadBytes);
+                read = stream2.read(buffer); // read remaining bytes
+                assertThat(read).isEqualTo(remainingReadBytes);
+                assertThat(buffer.array()).startsWith(returnedBuffers.get(1));
+            }
+        }
+    }
+
+    // Utils
+
+    private static ImmutableList<StreamBuffer> randomBuffers(int count)
+    {
+        return ImmutableList.copyOf(IntStream.range(0, count)
+                                             .mapToObj(buffer -> randomBuffer())
+                                             .collect(Collectors.toList()));
+    }
+
+    private static StreamBuffer randomBuffer()
+    {
+        return randomBuffer(DEFAULT_CHUNK_SIZE);
+    }
+
+    private static StreamBuffer randomBuffer(int size)
+    {
+        return StreamBuffer.wrap(RandomUtils.randomBytes(size));
+    }
+
+    @SuppressWarnings("StatementWithEmptyBody")
+    private static void readStreamFully(BufferingInputStream<SSTable> inputStream) throws IOException
+    {
+        try (BufferingInputStream<SSTable> in = inputStream)
+        {
+            while (in.read() >= 0)
+            {
+                // CHECKSTYLE IGNORE: Do nothing
+            }
+        }
+    }
+
+    private static void writeBuffers(StreamConsumer consumer, ImmutableList<StreamBuffer> buffers)
+    {
+        if (buffers.isEmpty())
+        {
+            // No more buffers so finished
+            consumer.onEnd();
+            return;
+        }
+
+        SCHEDULER.schedule(() -> {
+            EXECUTOR.submit(() -> {
+                // Write next buffer to StreamConsumer
+                consumer.onRead(buffers.get(0));
+                writeBuffers(consumer, buffers.subList(1, buffers.size()));
+            });
+        }, RandomUtils.RANDOM.nextInt(50), TimeUnit.MICROSECONDS);  // Inject random latency
+    }
+}

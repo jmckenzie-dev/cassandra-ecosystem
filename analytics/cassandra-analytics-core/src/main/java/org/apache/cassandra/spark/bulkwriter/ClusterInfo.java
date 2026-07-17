@@ -1,0 +1,105 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.apache.cassandra.spark.bulkwriter;
+
+import java.math.BigInteger;
+import java.util.Map;
+
+import com.google.common.collect.Range;
+
+import org.apache.cassandra.bridge.CassandraVersion;
+import org.apache.cassandra.spark.bulkwriter.token.TokenRangeMapping;
+import org.apache.cassandra.spark.data.ReplicationFactor;
+import org.apache.cassandra.spark.data.partitioner.Partitioner;
+import org.apache.cassandra.spark.exception.SidecarApiCallException;
+import org.apache.cassandra.spark.exception.TimeSkewTooLargeException;
+import org.apache.cassandra.spark.validation.StartupValidatable;
+import org.jetbrains.annotations.Nullable;
+
+/**
+ * Interface for cluster information used in bulk write operations.
+ * <p>
+ * Serialization Architecture:
+ * This interface does NOT extend Serializable. ClusterInfo instances are never directly serialized.
+ * Driver-only implementations ({@link CassandraClusterInfo},
+ * {@link org.apache.cassandra.spark.bulkwriter.cloudstorage.coordinated.CassandraClusterInfoGroup})
+ * are converted to broadcastable wrappers ({@link BroadcastableClusterInfo}, {@link BroadcastableClusterInfoGroup})
+ * for broadcasting to executors via {@link BulkWriterConfig}.
+ * <p>
+ * On executors, ClusterInfo instances are reconstructed from the broadcastable wrappers using
+ * {@link AbstractBulkWriterContext#reconstructClusterInfoOnExecutor(IBroadcastableClusterInfo)}.
+ */
+public interface ClusterInfo extends StartupValidatable
+{
+    void refreshClusterInfo();
+
+    TokenRangeMapping<RingInstance> getTokenRangeMapping(boolean cached);
+
+    CassandraVersion getBridgeVersion();
+
+    /**
+     * @return WriteAvailability per RingInstance in the cluster
+     */
+    Map<RingInstance, WriteAvailability> clusterWriteAvailability();
+
+    Partitioner getPartitioner();
+
+    void checkBulkWriterIsEnabledOrThrow();
+
+    /**
+     * Validate whether the time skew of the replicas of the range is acceptable
+     * @param range token range used to look up the relevant replicas
+     * @throws SidecarApiCallException when fails to retrieve time skew information
+     * @throws TimeSkewTooLargeException when the time skew has exceeded the allowance
+     */
+    void validateTimeSkew(Range<BigInteger> range) throws SidecarApiCallException, TimeSkewTooLargeException;
+
+    /**
+     * Return the keyspace schema string of the enclosing keyspace for bulk write in the cluster
+     * @param cached whether using the cached schema information
+     * @return keyspace schema string
+     */
+    String getKeyspaceSchema(boolean cached);
+
+    /**
+     * @return ReplicationFactor of the enclosing keyspace for bulk write in the cluster
+     */
+    ReplicationFactor replicationFactor();
+
+    CassandraContext getCassandraContext();
+
+    /**
+     * ID string that can uniquely identify a cluster
+     * <p>
+     * Implementor note: the method is optional. When writing to a single cluster, there is no requirement of assigning an ID for bulk write to proceed.
+     * When in the coordinated write mode, i.e. writing to multiple clusters, the method must be implemented and return unique string for clusters.
+     *
+     * @return cluster id string, null if absent
+     */
+    @Nullable
+    default String clusterId()
+    {
+        return null;
+    }
+
+    default void close()
+    {
+    }
+}

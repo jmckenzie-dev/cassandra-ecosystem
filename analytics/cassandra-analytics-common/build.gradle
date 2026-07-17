@@ -1,0 +1,54 @@
+import java.nio.file.Paths
+
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+plugins {
+    id('java-library')
+    id('maven-publish')
+}
+
+if (propertyWithDefault("artifactType", null) == "common")
+{
+    apply from: "$rootDir/gradle/common/publishing.gradle"
+}
+
+dependencies {
+    implementation("org.slf4j:slf4j-api:${slf4jApiVersion}")
+    compileOnly("com.esotericsoftware:kryo-shaded:${kryoVersion}")
+    compileOnly("com.google.guava:guava:${guavaVersion}")
+    compileOnly("com.fasterxml.jackson.core:jackson-annotations:${jacksonVersion}")
+    compileOnly("com.fasterxml.jackson.core:jackson-core:${jacksonVersion}")
+    compileOnly("com.fasterxml.jackson.core:jackson-databind:${jacksonVersion}")
+
+    testImplementation("com.google.guava:guava:${guavaVersion}")
+    testImplementation("com.esotericsoftware:kryo-shaded:${kryoVersion}")
+    testImplementation("com.fasterxml.jackson.core:jackson-annotations:${jacksonVersion}")
+    testImplementation("com.fasterxml.jackson.core:jackson-core:${jacksonVersion}")
+    testImplementation("com.fasterxml.jackson.core:jackson-databind:${jacksonVersion}")
+    testImplementation("org.junit.jupiter:junit-jupiter-api:${junitVersion}")
+    testImplementation("org.junit.jupiter:junit-jupiter-params:${junitVersion}")
+    testImplementation("org.junit.jupiter:junit-jupiter-engine:${junitVersion}")
+    testImplementation("org.assertj:assertj-core:${assertjCoreVersion}")
+    testImplementation("commons-io:commons-io:2.8.0")
+}
+
+test {
+    useJUnitPlatform()
+}

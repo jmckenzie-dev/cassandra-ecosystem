@@ -1,0 +1,156 @@
+import java.nio.file.Paths
+
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+plugins {
+    id('idea')
+    // A Java library
+    id('java-library')
+    // which is published
+    id('maven-publish')
+}
+
+if (propertyWithDefault("artifactType", null) == "spark") {
+    apply from: "$rootDir/gradle/common/publishing.gradle"
+}
+
+apply from: "${project.rootDir}/gradle/common/javaOptions.gradle"
+
+def integrationMaxHeapSize = System.getenv("INTEGRATION_MAX_HEAP_SIZE") ?: "3072M"
+println("Using ${integrationMaxHeapSize} maxHeapSize")
+
+// def integrationMaxParallelForks = (System.getenv("INTEGRATION_MAX_PARALLEL_FORKS") ?: "1") as int
+def integrationMaxParallelForks = 1
+println("Using ${integrationMaxParallelForks} maxParallelForks")
+
+def integrationEnableMtls = (System.getenv("INTEGRATION_MTLS_ENABLED") ?: "true") as boolean
+println("Using mTLS for tests? ${integrationEnableMtls}")
+
+configurations {
+    // remove netty-all dependency coming from spark
+    all*.exclude(group: 'io.netty', module: 'netty-all')
+    configureEach {
+        resolutionStrategy {
+            // Force set the vertx versions that do not depend on a newer jackson version
+            force("io.vertx:vertx-web:${vertxVersion}")
+            force("io.vertx:vertx-core:${vertxVersion}")
+            force("io.vertx:vertx-auth-common:${vertxVersion}")
+            force("io.vertx:vertx-dropwizard-metrics:${vertxVersion}")
+            force("io.vertx:vertx-web-client:${vertxVersion}")
+        }
+    }
+}
+
+dependencies {
+    testImplementation(project(':cassandra-analytics-core'))
+    testImplementation(group: 'net.java.dev.jna', name: 'jna', version: '5.9.0')
+    testImplementation(group: 'org.quicktheories', name: 'quicktheories', version: "${project.rootProject.quickTheoriesVersion}")
+
+    testImplementation(group: "${sparkGroupId}", name: "spark-core_${scalaMajorVersion}", version: "${sparkVersion}")
+    testImplementation(group: "${sparkGroupId}", name: "spark-sql_${scalaMajorVersion}", version: "${sparkVersion}")
+
+    testImplementation(project(path: ":cassandra-analytics-integration-framework"))
+
+    testImplementation(platform(group: 'software.amazon.awssdk', name:'bom', version:"${project.aswSdkVersion}"))
+    testImplementation('software.amazon.awssdk:s3')
+    testImplementation('software.amazon.awssdk:netty-nio-client')
+    testImplementation('io.netty:netty-transport-classes-epoll') {
+        version {
+            // Some integration tests are failing with version 4.1.100.final due to netty bootstrapping issue in cassandra java driver.
+            // Force the version to the old version unblocks the integration test.
+            strictly '4.1.86.Final'
+        }
+    }
+
+    testImplementation('com.adobe.testing:s3mock-testcontainers:2.17.0') // 3.x version do not support java 11
+    testImplementation('com.google.inject:guice:7.0.0')
+
+    testRuntimeOnly 'com.fasterxml.jackson.core:jackson-annotations:2.14.2'
+}
+
+// Shared test configuration for integration tests. When majorMinor is specified (e.g. "4.0"),
+// tests run against that single Cassandra version. When null, uses env var filtering
+// (CI) or falls back to default version (local dev).
+// Using a closure (not a method) so it captures the local variables above.
+def configureIntegrationTestTask = { Test task, String majorMinor = null ->
+    task.systemProperty "cassandra.test.dtest_jar_path", dependencyLocation
+    def versionInfo = rootProject.ext.applyCassandraVersionFilter(task, majorMinor)
+    if (versionInfo) {
+        task.systemProperty "cassandra.sidecar.versions_to_test", versionInfo.fullVersion
+    } else {
+        // Major.minor format to match integration framework's TestVersionSupplier; defaults to latest version only.
+        // 4.0 and 4.1 intentionally excluded from gradlew defaults to keep local iteration fast;
+        // use testCassandra40/testCassandra41 for targeted runs. CI covers all versions via CASSANDRA_VERSION.
+        task.systemProperty "cassandra.sidecar.versions_to_test", "5.0"
+    }
+    task.systemProperty "SKIP_STARTUP_VALIDATIONS", "true"
+    task.systemProperty "logback.configurationFile", "src/test/resources/logback-test.xml"
+    task.systemProperty "cassandra.integration.sidecar.test.enable_mtls", integrationEnableMtls
+    task.minHeapSize = '1g'
+    task.maxHeapSize = integrationMaxHeapSize
+    task.maxParallelForks = integrationMaxParallelForks
+    task.forkEvery = 1  // Enables different end-to-end test classes use Spark contexts with different configurations
+
+    // NOTE: Setting system properties in beforeTest only works because forkEvery = 1 ensures a fresh
+    // JVM per test class. If forkEvery is changed, these properties would stop varying per test.
+    task.beforeTest { descriptor ->
+        task.systemProperty "cassandra.testtag", "${descriptor.className}"
+        task.systemProperty "suitename", "${descriptor.name}"
+    }
+
+    task.jvmArgs(project.ext.JDK_OPTIONS)
+    println("JVM arguments for $project.name are ${task.allJvmArgs}")
+
+    // Some test classes are skipped entirely via assumeThat (e.g. MultipleTokens tests on C* 4.0).
+    // When CI runs individual classes with --tests, a skipped @BeforeAll leaves zero discovered tests,
+    // which Gradle treats as an error unless we tell it otherwise.
+    task.filter {
+        setFailOnNoMatchingTests(false)
+    }
+
+    // container test does not run on java 8
+    if ("true" == System.getenv("skipContainerTest") || JavaVersion.current().isJava8()) {
+        task.exclude("**/testcontainer/**")
+    }
+
+    task.useJUnitPlatform()
+}
+
+test {
+    configureIntegrationTestTask(delegate)
+}
+
+// Per-Cassandra-version test tasks for IDE convenience.
+// These show up in IntelliJ's Gradle panel alongside 'test'.
+rootProject.ext.cassandraVersionEnumMap.keySet().each { majorMinor ->
+    def suffix = majorMinor.replace(".", "")
+    tasks.register("testCassandra${suffix}", Test) {
+        description = "Run integration tests against Cassandra ${majorMinor}"
+        group = 'verification'
+        configureIntegrationTestTask(delegate, majorMinor)
+    }
+}
+
+java {
+    // Allows publishing the test jar
+    registerFeature("test") {
+        usingSourceSet(sourceSets.test)
+    }
+}

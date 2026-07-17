@@ -1,0 +1,516 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.apache.cassandra.spark.bulkwriter;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+
+import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Lists;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.tuple.Pair;
+
+import org.apache.cassandra.bridge.CassandraBridge;
+import org.apache.cassandra.bridge.CassandraBridgeFactory;
+import org.apache.cassandra.bridge.CassandraVersion;
+import org.apache.cassandra.spark.common.schema.ColumnType;
+import org.apache.cassandra.spark.data.CqlField;
+import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.sql.types.StructType;
+import org.jetbrains.annotations.NotNull;
+
+import static org.apache.cassandra.spark.bulkwriter.SqlToCqlTypeConverter.CUSTOM;
+import static org.apache.cassandra.spark.bulkwriter.SqlToCqlTypeConverter.LIST;
+import static org.apache.cassandra.spark.bulkwriter.SqlToCqlTypeConverter.MAP;
+import static org.apache.cassandra.spark.bulkwriter.SqlToCqlTypeConverter.SET;
+import static org.apache.cassandra.spark.bulkwriter.SqlToCqlTypeConverter.UDT;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+public final class TableSchemaTestCommon
+{
+    private TableSchemaTestCommon()
+    {
+        throw new IllegalStateException(getClass() + " is static utility class and shall not be instantiated");
+    }
+
+    public static Pair<StructType, ImmutableMap<String, CqlField.CqlType>> buildMatchedDataframeAndCqlColumns(
+            String[] fieldNames,
+            org.apache.spark.sql.types.DataType[] sparkTypes,
+            CqlField.CqlType[] cqlTypes)
+    {
+        StructType dataFrameSchema = new StructType();
+        ImmutableMap.Builder<String, CqlField.CqlType> cqlColumnsBuilder = ImmutableMap.builder();
+        for (int field = 0; field < fieldNames.length; field++)
+        {
+            dataFrameSchema = dataFrameSchema.add(fieldNames[field], sparkTypes[field]);
+            cqlColumnsBuilder.put(fieldNames[field], cqlTypes[field]);
+        }
+
+        ImmutableMap<String, CqlField.CqlType> cqlColumns = cqlColumnsBuilder.build();
+        return Pair.of(dataFrameSchema, cqlColumns);
+    }
+
+    @NotNull
+    public static CqlField.CqlType mockCqlType(String cqlName)
+    {
+        CqlField.CqlType mock = mock(CqlField.CqlType.class);
+        when(mock.name()).thenReturn(cqlName);
+        return mock;
+    }
+
+    @NotNull
+    public static CqlField.CqlCustom mockCqlCustom(String customTypeClassName)
+    {
+        CqlField.CqlCustom mock = mock(CqlField.CqlCustom.class);
+        when(mock.name()).thenReturn(CUSTOM);
+        when(mock.customTypeClassName()).thenReturn(customTypeClassName);
+        return mock;
+    }
+
+    @NotNull
+    public static CqlField.CqlCollection mockSetCqlType(String collectionCqlType)
+    {
+        return mockCollectionCqlType(SET, mockCqlType(collectionCqlType));
+    }
+
+    @NotNull
+    public static CqlField.CqlCollection mockListCqlType(String collectionCqlType)
+    {
+        return mockCollectionCqlType(LIST, mockCqlType(collectionCqlType));
+    }
+
+    @NotNull
+    public static CqlField.CqlCollection mockListCqlType(CqlField.CqlType collectionType)
+    {
+        return mockCollectionCqlType(LIST, collectionType);
+    }
+
+    @NotNull
+    public static CqlField.CqlCollection mockCollectionCqlType(String cqlName, CqlField.CqlType collectionType)
+    {
+        CqlField.CqlCollection mock = mock(CqlField.CqlCollection.class);
+        when(mock.name()).thenReturn(cqlName);
+        when(mock.type()).thenReturn(collectionType);
+        return mock;
+    }
+
+    @NotNull
+    public static CqlField.CqlTuple mockTupleCqlType(List<CqlField.CqlType> types)
+    {
+        CqlField.CqlTuple mock = mock(CqlField.CqlTuple.class);
+        when(mock.name()).thenReturn(SqlToCqlTypeConverter.TUPLE);
+        when(mock.internalType()).thenReturn(CqlField.CqlType.InternalType.Tuple);
+        when(mock.types()).thenReturn(types);
+        return mock;
+    }
+
+    @NotNull
+    public static CqlField.CqlType mockMapCqlType(String keyCqlName, String valueCqlName)
+    {
+        return mockMapCqlType(mockCqlType(keyCqlName), mockCqlType(valueCqlName));
+    }
+
+    @NotNull
+    public static CqlField.CqlMap mockMapCqlType(CqlField.CqlType keyType, CqlField.CqlType valueType)
+    {
+        CqlField.CqlMap mock = mock(CqlField.CqlMap.class);
+        when(mock.name()).thenReturn(MAP);
+        when(mock.keyType()).thenReturn(keyType);
+        when(mock.valueType()).thenReturn(valueType);
+        return mock;
+    }
+
+    @NotNull
+    public static CqlField.CqlUdt mockUdtCqlType(String name, String... namesAndTypes)
+    {
+        assert namesAndTypes.length > 0 && (namesAndTypes.length % 2) == 0;
+        HashMap<String, CqlField> udtDef = new HashMap<>();
+        CqlField.CqlUdt udtMock = mock(CqlField.CqlUdt.class);
+        when(udtMock.cqlName()).thenReturn(name);
+        when(udtMock.internalType()).thenReturn(CqlField.CqlType.InternalType.Udt);
+        when(udtMock.name()).thenReturn(UDT);
+        List<CqlField> fields = new ArrayList<>();
+        for (int i = 0; i < namesAndTypes.length; i += 2)
+        {
+            String field = namesAndTypes[i];
+            String type = namesAndTypes[i + 1];
+            CqlField mock = mock(CqlField.class);
+            when(mock.name()).thenReturn(field);
+            when(mock.cqlTypeName()).thenReturn(type);
+            CqlField.CqlType fieldType = mockCqlType(type);
+            when(mock.type()).thenReturn(fieldType);
+            udtDef.put(field, mock);
+            when(udtMock.field(i / 2)).thenReturn(mock);
+            when(udtMock.field(field)).thenReturn(mock);
+            fields.add(mock);
+        }
+        when(udtMock.fields()).thenReturn(fields);
+        return udtMock;
+    }
+
+    public static TableSchema buildSchema(String cassandraVersion,
+                                          String[] fieldNames,
+                                          org.apache.spark.sql.types.DataType[] sparkTypes,
+                                          CqlField.CqlType[] driverTypes,
+                                          String[] partitionKeyColumns,
+                                          ColumnType<?>[] partitionKeyColumnTypes,
+                                          String[] primaryKeyColumnNames)
+    {
+        Pair<StructType, ImmutableMap<String, CqlField.CqlType>> pair = buildMatchedDataframeAndCqlColumns(fieldNames, sparkTypes, driverTypes);
+        ImmutableMap<String, CqlField.CqlType> cqlColumns = pair.getValue();
+        StructType dataFrameSchema = pair.getKey();
+        return
+            new MockTableSchemaBuilder(CassandraBridgeFactory.get(cassandraVersion))
+                .withCqlColumns(cqlColumns)
+                .withPartitionKeyColumns(partitionKeyColumns)
+                .withPrimaryKeyColumnNames(primaryKeyColumnNames)
+                .withCassandraVersion(cassandraVersion)
+                .withPartitionKeyColumnTypes(partitionKeyColumnTypes)
+                .withWriteMode(WriteMode.INSERT)
+                .withDataFrameSchema(dataFrameSchema)
+                .build();
+    }
+
+    public static class MockTableSchemaBuilder
+    {
+        private final CassandraBridge bridge;
+        private ImmutableMap<String, CqlField.CqlType> cqlColumns;
+        private String[] partitionKeyColumns;
+        private String[] primaryKeyColumnNames;
+        private String cassandraVersion;
+        private ColumnType[] partitionKeyColumnTypes;
+        private StructType dataFrameSchema;
+        private WriteMode writeMode = null;
+        private TTLOption ttlOption = TTLOption.forever();
+        private TimestampOption timestampOption = TimestampOption.now();
+        private boolean quoteIdentifiers = false;
+        private boolean skipSecondaryIndexCheck = false;
+        private boolean hasSecondaryIndex = false;
+
+        public MockTableSchemaBuilder(CassandraBridge bridge)
+        {
+            this.bridge = bridge;
+        }
+
+        public MockTableSchemaBuilder withCqlColumns(@NotNull Map<String, CqlField.CqlType> cqlColumns)
+        {
+            Preconditions.checkNotNull(cqlColumns, "cqlColumns cannot be null");
+            Preconditions.checkArgument(!cqlColumns.isEmpty(), "cqlColumns cannot be empty");
+            this.cqlColumns = ImmutableMap.copyOf(cqlColumns);
+            return this;
+        }
+
+        public MockTableSchemaBuilder withPartitionKeyColumns(@NotNull String... partitionKeyColumns)
+        {
+            Preconditions.checkNotNull(partitionKeyColumns, "partitionKeyColumns cannot be null");
+            Preconditions.checkArgument(partitionKeyColumns.length > 0, "partitionKeyColumns cannot be empty");
+            this.partitionKeyColumns = partitionKeyColumns;
+            return this;
+        }
+
+        public MockTableSchemaBuilder withPrimaryKeyColumnNames(@NotNull String... primaryKeyColumnNames)
+        {
+            Preconditions.checkNotNull(primaryKeyColumnNames, "primaryKeyColumnNames cannot be null");
+            Preconditions.checkArgument(primaryKeyColumnNames.length > 0, "primaryKeyColumnNames cannot be empty");
+            this.primaryKeyColumnNames = primaryKeyColumnNames;
+            return this;
+        }
+
+        public MockTableSchemaBuilder withCassandraVersion(@NotNull String cassandraVersion)
+        {
+            Preconditions.checkNotNull(cassandraVersion, "cassandraVersion cannot be null");
+            Preconditions.checkArgument(!cassandraVersion.isEmpty(), "cassandraVersion cannot be an empty string");
+            this.cassandraVersion = cassandraVersion;
+            return this;
+        }
+
+        public MockTableSchemaBuilder withPartitionKeyColumnTypes(@NotNull ColumnType<?>... partitionKeyColumnTypes)
+        {
+            Preconditions.checkNotNull(partitionKeyColumnTypes, "partitionKeyColumnTypes cannot be null");
+            Preconditions.checkArgument(partitionKeyColumnTypes.length > 0, "partitionKeyColumnTypes cannot be empty");
+            this.partitionKeyColumnTypes = Arrays.copyOf(partitionKeyColumnTypes, partitionKeyColumnTypes.length);
+            return this;
+        }
+
+        public MockTableSchemaBuilder withWriteMode(@NotNull WriteMode writeMode)
+        {
+            Preconditions.checkNotNull(writeMode, "writeMode cannot be null");
+            this.writeMode = writeMode;
+            return this;
+        }
+
+        public MockTableSchemaBuilder withDataFrameSchema(StructType dataFrameSchema)
+        {
+            Preconditions.checkNotNull(dataFrameSchema, "dataFrameSchema cannot be null");
+            Preconditions.checkArgument(dataFrameSchema.nonEmpty(), "dataFrameSchema cannot be empty");
+            this.dataFrameSchema = dataFrameSchema;
+            return this;
+        }
+
+        public MockTableSchemaBuilder withTTLSetting(TTLOption ttlOption)
+        {
+            this.ttlOption = ttlOption;
+            return this;
+        }
+
+        public MockTableSchemaBuilder withTimeStampSetting(TimestampOption timestampOption)
+        {
+            this.timestampOption = timestampOption;
+            return this;
+        }
+
+        public MockTableSchemaBuilder withQuotedIdentifiers()
+        {
+            this.quoteIdentifiers = true;
+            return this;
+        }
+
+        public MockTableSchemaBuilder withSkipSecondaryIndexCheck()
+        {
+            this.skipSecondaryIndexCheck = true;
+            return this;
+        }
+
+        public MockTableSchemaBuilder withHasSecondaryIndex()
+        {
+            this.hasSecondaryIndex = true;
+            return this;
+        }
+
+        private ImmutableMap<String, CqlField.CqlType> addColumnToCqlColumns(ImmutableMap<String, CqlField.CqlType> currentColumns,
+                                                                             String columnName,
+                                                                             String cqlType)
+        {
+            ImmutableMap.Builder<String, CqlField.CqlType> builder = ImmutableMap.builder();
+            builder.putAll(currentColumns);
+            builder.put(columnName, mockCqlType(cqlType));
+            return builder.build();
+        }
+
+        public TableSchema build()
+        {
+            Objects.requireNonNull(cqlColumns,
+                                   "cqlColumns cannot be null. Please provide a list of columns by calling #withCqlColumns");
+            Objects.requireNonNull(partitionKeyColumns,
+                                   "partitionKeyColumns cannot be null. Please provide a list of columns by calling #withPartitionKeyColumns");
+            Objects.requireNonNull(primaryKeyColumnNames,
+                                   "primaryKeyColumnNames cannot be null. Please provide a list of columns by calling #withPrimaryKeyColumnNames");
+            Objects.requireNonNull(cassandraVersion,
+                                   "cassandraVersion cannot be null. Please provide a list of columns by calling #withCassandraVersion");
+            Objects.requireNonNull(partitionKeyColumnTypes,
+                                   "partitionKeyColumnTypes cannot be null. Please provide a list of columns by calling #withPartitionKeyColumnTypes");
+            Objects.requireNonNull(writeMode,
+                                   "writeMode cannot be null. Please provide the write mode by calling #withWriteMode");
+            Objects.requireNonNull(dataFrameSchema,
+                                   "dataFrameSchema cannot be null. Please provide the write mode by calling #withDataFrameSchema");
+
+            ImmutableMap<String, CqlField.CqlType> updatedCqlColumns = cqlColumns;
+            if (ttlOption.withTTl() && ttlOption.columnName() != null)
+            {
+                dataFrameSchema = dataFrameSchema.add(ttlOption.columnName(), DataTypes.IntegerType);
+                updatedCqlColumns = addColumnToCqlColumns(updatedCqlColumns, ttlOption.columnName(), SqlToCqlTypeConverter.INT);
+            }
+            if (timestampOption.withTimestamp() && timestampOption.columnName() != null)
+            {
+                dataFrameSchema = dataFrameSchema.add(timestampOption.columnName(), DataTypes.LongType);
+                updatedCqlColumns = addColumnToCqlColumns(updatedCqlColumns, timestampOption.columnName(), SqlToCqlTypeConverter.BIGINT);
+            }
+            // Validate the configured version is supported and resolve the bridge version it maps to.
+            CassandraVersion bridgeVersion = CassandraVersion.fromVersion(cassandraVersion)
+                                                             .orElseThrow(
+                                                             () -> new IllegalArgumentException("Unsupported Cassandra version: " + cassandraVersion));
+
+            MockTableInfoProvider tableInfoProvider = new MockTableInfoProvider(bridge,
+                                                                                updatedCqlColumns,
+                                                                                partitionKeyColumns,
+                                                                                partitionKeyColumnTypes,
+                                                                                primaryKeyColumnNames,
+                                                                                cassandraVersion,
+                                                                                quoteIdentifiers,
+                                                                                hasSecondaryIndex);
+            return new TableSchema(dataFrameSchema,
+                                   tableInfoProvider,
+                                   writeMode,
+                                   ttlOption,
+                                   timestampOption,
+                                   bridgeVersion,
+                                   quoteIdentifiers,
+                                   skipSecondaryIndexCheck);
+        }
+    }
+
+    public static class MockTableInfoProvider implements TableInfoProvider
+    {
+        public static final String TEST_TABLE_PREFIX = "test_table_";
+        public static final AtomicInteger TEST_TABLE_ID = new AtomicInteger(0);
+        private final CassandraBridge bridge;
+        private final ImmutableMap<String, CqlField.CqlType> cqlColumns;
+        private final String[] partitionKeyColumns;
+        private final ColumnType[] partitionKeyColumnTypes;
+        private final String[] primaryKeyColumnNames;
+        private final String uniqueTableName;
+        Map<String, CqlField.CqlType> columns;
+        private final String cassandraVersion;
+        private final boolean quoteIdentifiers;
+        private final boolean hasSecondaryIndex;
+
+        public MockTableInfoProvider(CassandraBridge bridge,
+                                     ImmutableMap<String, CqlField.CqlType> cqlColumns,
+                                     String[] partitionKeyColumns,
+                                     ColumnType[] partitionKeyColumnTypes,
+                                     String[] primaryKeyColumnNames,
+                                     String cassandraVersion,
+                                     boolean quoteIdentifiers)
+        {
+            this(bridge, cqlColumns, partitionKeyColumns, partitionKeyColumnTypes, primaryKeyColumnNames, cassandraVersion, quoteIdentifiers, false);
+        }
+
+        public MockTableInfoProvider(CassandraBridge bridge,
+                                     ImmutableMap<String, CqlField.CqlType> cqlColumns,
+                                     String[] partitionKeyColumns,
+                                     ColumnType[] partitionKeyColumnTypes,
+                                     String[] primaryKeyColumnNames,
+                                     String cassandraVersion,
+                                     boolean quoteIdentifiers,
+                                     boolean hasSecondaryIndex)
+        {
+            this.bridge = bridge;
+            this.cqlColumns = cqlColumns;
+            this.partitionKeyColumns = partitionKeyColumns;
+            this.partitionKeyColumnTypes = partitionKeyColumnTypes;
+            this.primaryKeyColumnNames = primaryKeyColumnNames;
+            columns = cqlColumns;
+            this.cassandraVersion = cassandraVersion.replaceAll("(\\w+-)*cassandra-", "");
+            this.quoteIdentifiers = quoteIdentifiers;
+            this.hasSecondaryIndex = hasSecondaryIndex;
+            this.uniqueTableName = TEST_TABLE_PREFIX + TEST_TABLE_ID.getAndIncrement();
+        }
+
+        @Override
+        public CqlField.CqlType getColumnType(String columnName)
+        {
+            return columns.get(columnName);
+        }
+
+        @Override
+        public List<ColumnType<?>> getPartitionKeyTypes()
+        {
+            return Lists.newArrayList(partitionKeyColumnTypes);
+        }
+
+        @Override
+        public boolean columnExists(String columnName)
+        {
+            return columns.containsKey(columnName);
+        }
+
+        @Override
+        public List<String> getPartitionKeyColumnNames()
+        {
+            return Arrays.asList(partitionKeyColumns);
+        }
+
+        @Override
+        public String getCreateStatement()
+        {
+            String keyDef = getKeyDef();
+            String createStatement = "CREATE TABLE test." + uniqueTableName + " (" + cqlColumns.entrySet()
+                                            .stream()
+                                            .map(column -> maybeQuoteIdentifierIfRequested(column.getKey()) + " " + column.getValue().name())
+                                            .collect(Collectors.joining(",\n")) + ", " + keyDef + ") "
+                                   + "WITH COMPRESSION = {'class': '" + getCompression() + "'};";
+            System.out.println("Create Table:" + createStatement);
+            return createStatement;
+        }
+
+        private String getCompression()
+        {
+            switch (cassandraVersion.charAt(0))
+            {
+                case '5':
+                case '4':
+                    return "ZstdCompressor";
+                case '3':
+                    return "LZ4Compressor";
+                default:
+                    return "LZ4Compressor";
+            }
+        }
+
+        private String getKeyDef()
+        {
+            List<String> partitionColumns = Lists.newArrayList(partitionKeyColumns);
+            List<String> primaryColumns = Lists.newArrayList(primaryKeyColumnNames);
+            primaryColumns.removeAll(partitionColumns);
+            String partitionKey = Arrays.stream(partitionKeyColumns)
+                                        .map(this::maybeQuoteIdentifierIfRequested)
+                                        .collect(Collectors.joining(",", "(", ")"));
+            String clusteringKey = primaryColumns.stream()
+                                                 .map(this::maybeQuoteIdentifierIfRequested)
+                                                 .collect(Collectors.joining(","));
+            return "PRIMARY KEY (" + partitionKey + (StringUtils.isNotBlank(clusteringKey) ? ("," + clusteringKey) : "") + ")";
+        }
+
+        @Override
+        public List<String> getPrimaryKeyColumnNames()
+        {
+            return Arrays.asList(primaryKeyColumnNames);
+        }
+
+        @Override
+        public String getName()
+        {
+            return uniqueTableName;
+        }
+
+        @Override
+        public String getKeyspaceName()
+        {
+            return "test";
+        }
+
+        @Override
+        public boolean hasSecondaryIndex()
+        {
+            return hasSecondaryIndex;
+        }
+
+        @Override
+        public List<String> getColumnNames()
+        {
+            return cqlColumns.keySet().asList();
+        }
+
+        private String maybeQuoteIdentifierIfRequested(String identifier)
+        {
+            return quoteIdentifiers
+                   ? bridge.maybeQuoteIdentifier(identifier)
+                   : identifier;
+        }
+    }
+}

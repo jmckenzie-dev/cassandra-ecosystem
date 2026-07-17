@@ -1,0 +1,458 @@
+import org.nosphere.apache.rat.RatTask
+
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import java.nio.file.Files
+import java.nio.file.Paths
+
+plugins {
+  id 'java'
+  id 'java-library'
+  id 'com.github.johnrengelman.shadow' version '8.1.1'
+
+  id 'distribution'
+  id 'signing'
+
+  // Release Audit Tool (RAT) plugin for checking project licenses
+  id("org.nosphere.apache.rat") version "0.8.1"
+
+  id 'org.asciidoctor.jvm.convert' version '3.3.2'
+}
+
+repositories {
+  mavenCentral()
+}
+
+ext.scalaLabel = System.getenv("SCALA_VERSION") ?: "${scala}"
+println("Scala version: ${ext.scalaLabel}")
+
+ext.sparkLabel = (System.getenv("SPARK_VERSION") ?: "${spark}").split(/\./)[0]
+println("Spark version: ${ext.sparkLabel}")
+
+ext.jdkLabel = System.getenv("JDK_VERSION") ?: "${analyticsJDKLevel}"
+println("Java source/target compatibility level: ${ext.jdkLabel}")
+
+// validate the builder is indeed using the correct JDK_VERSION as specified
+String actualJdkVersion = System.getProperty("java.version")
+if (!actualJdkVersion.startsWith(ext.jdkLabel))
+{
+  def errorMessage = "Invalid jdk version (Found: ${actualJdkVersion}) for jdk-${ext.jdkLabel} build"
+  throw new RuntimeException(errorMessage)
+}
+
+ext.dependencyLocation = (System.getenv("CASSANDRA_DEP_DIR") ?: "${rootDir}/dependencies") + "/"
+
+// Cassandra version maps used by subproject test tasks to filter parameterized tests
+// to a single version when CASSANDRA_VERSION env var is set (e.g. in CI).
+// NOTE: Both maps below must stay in sync with the defaults in CassandraVersion.java
+// (cassandra-analytics-common/.../bridge/CassandraVersion.java):
+//   - cassandraVersionEnumMap values must match the implemented_versions default
+//   - cassandraFullVersionMap values must match the supported_versions default
+// NOTE: Both maps must ALSO stay in sync with the values in build-dtest-jars.sh
+ext.cassandraVersionEnumMap = ["4.0": "FOURZERO", "4.1": "FOURONE", "5.0": "FIVEZERO"]
+ext.cassandraFullVersionMap = ["4.0": "4.0.17", "4.1": "4.1.4", "5.0": "5.0.5"]
+
+// Shared helper: sets implemented_versions and supported_versions system properties on a Test task.
+// When majorMinor is provided (e.g. "4.0"), uses that version directly.
+// When majorMinor is null, falls back to the CASSANDRA_VERSION env var (CI path).
+// Returns a map with version info [majorMinor, enumName, fullVersion], or null when no version is set.
+ext.applyCassandraVersionFilter = { Test task, String majorMinor = null ->
+    if (!majorMinor) {
+        def ver = System.getenv("CASSANDRA_VERSION")
+        if (!ver) return null
+        majorMinor = ver.split("\\.").take(2).join(".")
+    }
+
+    def enumName = cassandraVersionEnumMap[majorMinor]
+    if (!enumName) {
+        throw new GradleException("Unknown CASSANDRA_VERSION: ${majorMinor}. " +
+                                  "Valid versions: ${cassandraVersionEnumMap.keySet()}")
+    }
+    def fullVersion = cassandraFullVersionMap[majorMinor]
+
+    task.systemProperty "cassandra.analytics.bridges.implemented_versions", enumName
+    task.systemProperty "cassandra.analytics.bridges.supported_versions", "cassandra-${fullVersion}"
+
+    return [majorMinor: majorMinor, enumName: enumName, fullVersion: fullVersion]
+}
+
+def buildDir = layout.buildDirectory.get().asFile.toPath()
+def ratExcludeFilePath = buildDir.resolve(".rat-excludes.txt")
+System.out.println("Rat exclude file:" + ratExcludeFilePath)
+
+def profile = "profiles/scala-${ext.scalaLabel}-spark-${ext.sparkLabel}-jdk-${ext.jdkLabel}.gradle"
+
+if (!file(profile).exists()) {
+  throw new InvalidUserDataException("Profile ${profile} does not exist, which indicates this combination of Scala, Spark, and Java is unsupported.\n" +
+          "Please either add an appropriate profile if this combination should work, or use a different one.")
+}
+
+println("Using profile ${profile}")
+apply(from: profile)
+
+apply(plugin: 'idea')
+
+// Force checkstyle and rat to run before test tasks for faster feedback
+def codeCheckTasks = task("codeCheckTasks")
+
+
+tasks.register('copyCodeStyle', Copy) {
+  from('ide/idea/codeStyleSettings.xml')
+  into('.idea')
+}
+
+tasks.idea.dependsOn(tasks.copyCodeStyle)
+
+tasks.register('copyInspections', Copy) {
+  from('ide/idea/Project_Default.xml')
+  into('.idea/inspectionProfiles')
+}
+tasks.idea.dependsOn(tasks.copyInspections)
+
+tasks.register('buildIgnoreRatList', Exec) {
+  description 'Builds a list of ignored files for the rat task from the unversioned git files'
+  commandLine 'bash', '-c', 'git clean --force -d --dry-run -x | grep -v "Would skip" | cut -c 14- '
+  doFirst {
+  // make sure the build directory exists so rat task can run independently
+    Files.createDirectories(buildDir)
+    standardOutput new FileOutputStream(ratExcludeFilePath.toFile())
+  }
+  // allows task to fail when git/cut commands are unavailable or fail
+  ignoreExitValue = true
+}
+
+rat {
+
+  doFirst {
+    def excludeFilePath = ratExcludeFilePath
+    def excludeLines = Files.readAllLines(excludeFilePath)
+    excludeLines.each { line ->
+      if (line.endsWith("/")) {
+        excludes.add("**/" + line + "**")
+      } else {
+        excludes.add(line)
+      }
+    }
+  }
+
+  // List of Gradle exclude directives, defaults to ['**/.gradle/**']
+  excludes.add("**/build/**")
+  excludes.add("CHANGES.txt")
+  excludes.add("**/org.apache.spark.sql.sources.DataSourceRegister")
+
+  // Sidecar for build process
+  excludes.add("**/cassandra-sidecar/**")
+
+  // Documentation files
+  excludes.add("**/docs/src/**")
+  // gradle files
+  excludes.add("gradle/**")
+  excludes.add("gradlew")
+  excludes.add("gradlew.bat")
+
+  // resource files for test
+  excludes.add("**/test**/resources/**")
+
+  // resources
+  excludes.add("**/resources/sidecar.version")
+  excludes.add("**/dependencies/**")
+
+  // Rat excludes file, one directive per line
+  excludeFile.set(ratExcludeFilePath.toFile())
+
+  // XML, TXT and HTML reports directory, defaults to 'build/reports/rat'
+  reportDir.set(file("build/reports/rat"))
+
+  excludes.add("AGENTS.md")
+  excludes.add("SECURITY.md")
+}
+
+tasks.named('rat').configure {
+  dependsOn(buildIgnoreRatList)
+}
+
+subprojects {
+  apply(plugin: 'java-library')
+  apply(plugin: 'checkstyle')
+
+  apply from: "${project.rootDir}/gradle/common/javaOptions.gradle"
+
+  sourceCompatibility = "${project.rootProject.ext.jdkLabel}"
+  targetCompatibility = "${project.rootProject.ext.jdkLabel}"
+
+  configurations {
+    configureEach {
+      resolutionStrategy {
+        // Force set the jackson version that matches with the one from spark's dependencies.
+        // Do not favor newer jackson version from others, because that jackson module scala has a strict check
+        // on the paired jackson dependency.
+        force("com.fasterxml.jackson.module:jackson-module-scala_${scalaMajorVersion}:${jacksonScalaModuleVersion}")
+        force("com.fasterxml.jackson.core:jackson-core:${jacksonVersion}")
+        force("com.fasterxml.jackson.core:jackson-annotations:${jacksonVersion}")
+        force("com.fasterxml.jackson.core:jackson-databind:${jacksonVersion}")
+      }
+    }
+  }
+
+  tasks.withType(JavaCompile) {
+    if ("${project.rootProject.ext.jdkLabel}" == '1.8') {
+      // Unfortunately, we can't use release here. We can only use public APIs when using release.
+      // org.apache.cassandra.spark.bulkwriter.util.FastByteOperations uses sun.misc.Unsafe which is causing the build
+      // to fail.
+      options.compilerArgs += ['-source', '8', '-target', '8']
+    } else {
+      options.release = 11
+    }
+  }
+
+  archivesBaseName = "${project.name}"
+
+  repositories {
+    mavenCentral()
+    // for dtest-jars
+    mavenLocal {
+      url Paths.get(dependencyLocation)
+    }
+  }
+
+  dependencies {
+    compileOnly(group: 'com.intellij', name: 'annotations', version: "${project.rootProject.intellijVersion}")
+    testCompileOnly(group: 'com.intellij', name: 'annotations', version: "${project.rootProject.intellijVersion}")
+  }
+
+  sourceSets {
+    main {
+      java {
+        srcDirs += ["src/main/spark${project.rootProject.ext.sparkLabel}",
+                    "src/main/scala-${scalaMajorVersion}-spark-${sparkMajorVersion}"]
+      }
+    }
+    test {
+      java {
+        srcDirs += ["src/test/spark${project.rootProject.ext.sparkLabel}",
+                    "src/test/scala-${scalaMajorVersion}-spark-${sparkMajorVersion}"]
+      }
+    }
+  }
+
+  // We want to get all the exception information we can on test failure in a multi-node in-jvm env
+  tasks.withType(Test).configureEach { testTask ->
+    reports {
+      junitXml.outputLocation.set(rootProject.file("build/test-results/${project.name}/${testTask.name}"))
+      html.outputLocation.set(rootProject.file("build/reports/tests/${project.name}/${testTask.name}"))
+    }
+    testLogging {
+      events "started", "passed", "skipped", "failed"
+      exceptionFormat "full"
+      showExceptions true
+      showCauses true
+      showStackTraces true
+    }
+
+    def heapDumpPath = "${project.rootProject.rootDir}/build/${project.name}/heapDumps"
+    Files.createDirectories(Paths.get(heapDumpPath))
+    def jdkOptions = project.ext.JDK_OPTIONS
+
+    jdkOptions += [
+            '-XX:+HeapDumpOnOutOfMemoryError',
+            "-XX:HeapDumpPath=${heapDumpPath}",
+    ]
+    jvmArgs(jdkOptions)
+    println("JVM arguments for $project.name are $allJvmArgs")
+  }
+
+  codeCheckTasks.dependsOn(tasks.withType(Checkstyle))
+  codeCheckTasks.dependsOn(tasks.withType(RatTask))
+
+  tasks.withType(Test) {
+    shouldRunAfter(codeCheckTasks)
+    shouldRunAfter(tasks.withType(Checkstyle))
+    shouldRunAfter(tasks.withType(RatTask))
+  }
+
+  tasks.register('printCodeVersion') {
+    println()
+    println(version)
+  }
+}
+
+distributions {
+  main {
+    distributionBaseName = 'apache-cassandra-analytics'
+    contents {
+      from('.') {
+        include 'LICENSE.txt'
+        include 'NOTICE.txt'
+        include 'CHANGES.txt'
+      }
+
+      // Include all project JARs in lib/ directory
+      into('lib') {
+        from subprojects.collect { it.tasks.withType(Jar) }
+      }
+
+      setDuplicatesStrategy(DuplicatesStrategy.INCLUDE)
+    }
+  }
+
+  // Packages the sources as a tarball for distribution
+  sources {
+    distributionBaseName = 'apache-cassandra-analytics'
+    distributionClassifier = 'src'
+    contents {
+      from '.'
+      include '**/*.*'
+      include 'scripts/mvnw'
+      include 'gradlew'
+      include 'build.gradle'
+      exclude '**/.gradle/**'
+      exclude 'gradle/wrapper/gradle-wrapper.jar'
+      exclude 'scripts/.mvn/wrapper/maven-wrapper.jar'
+      exclude '**.idea/**'
+      exclude 'bin/**'
+      exclude 'dependencies/**'
+      exclude '**lib/**'
+      exclude '**logs/**'
+      exclude '**/build/**'
+      exclude '**/out/**'
+      exclude '**/target/**'
+    }
+  }
+}
+
+tasks.named('distTar').configure {
+  compression = Compression.GZIP
+  archiveExtension = "tar.gz"
+}
+
+tasks.named('sourcesDistTar').configure {
+  compression = Compression.GZIP
+  archiveExtension = "tar.gz"
+}
+
+ext {
+  // A common method to handle loading gradle properties with a default when
+  // no definition is found. The property value is determined by the following
+  // priority order (top is highest priority):
+  //    - gradle property (-Pproperty=value)
+  //    - system property (-Dproperty=value)
+  //    - environment variable
+  //    - default value
+  // See more details on gradle property handling here:
+  //    https://docs.gradle.org/current/userguide/build_environment.html#sec:gradle_properties_and_system_properties
+  propertyWithDefault = { property, defaultValue ->
+    def value = defaultValue
+    def envValue = System.getenv(property)
+    if (envValue != null) {
+      value = envValue
+    }
+    def systemValue = System.getProperty(property)
+    if (systemValue != null) {
+      value = systemValue
+    }
+    def projectValue = project.hasProperty(property) ? project.property(property) : null
+    if (projectValue != null) {
+      value = projectValue
+    }
+    return value
+  }
+
+  // Returns true if the property has been set, otherwise false.
+  propertyExists = { property ->
+    System.getenv(property) != null || System.getProperty(property) != null || project.hasProperty(property)
+  }
+
+  dependencyLocation = propertyWithDefault("CASSANDRA_DEP_DIR", "${rootDir}/dependencies") + "/"
+
+  // This allows simplified builds and local maven installs.
+  forceSigning = propertyExists("forceSigning")
+  skipSigning = propertyExists("skipSigning")
+  shouldSign =
+          // Always sign artifacts if -PforceSigning is passed.
+          forceSigning ||
+                  // Skip signing artifacts by default if -PskipSigning is passed.
+                  (!skipSigning
+                          // Sign artifacts if the version is not a snapshot, and we are uploading them to maven.
+                          && !version.endsWith("SNAPSHOT")
+                          && project.gradle.startParameter.taskNames.any { it.contains("upload") })
+
+}
+
+signing {
+    required { shouldSign }
+    if (shouldSign) {
+        useGpgCmd()
+    }
+    sign distZip
+    sign distTar
+    sign sourcesDistTar
+    sign sourcesDistZip
+}
+
+// Generate SHA-256 and SHA-512 checksums for distribution artifacts
+// Required for Apache releases
+tasks.register('generateDistributionChecksums') {
+    description = 'Generates SHA-256 and SHA-512 checksums for distribution artifacts'
+    group = 'distribution'
+
+    dependsOn distTar, distZip, sourcesDistTar, sourcesDistZip
+
+    doLast {
+        println "Generating checksums for distribution archives..."
+        [distTar, distZip, sourcesDistTar, sourcesDistZip].each { task ->
+            def archive = task.archiveFile.get().asFile
+
+            if (archive.exists()) {
+                // Generate SHA-256 checksum
+                def sha256File = new File("${archive}.sha256")
+                def sha256 = java.security.MessageDigest.getInstance("SHA-256")
+                archive.withInputStream { is ->
+                    def buffer = new byte[8192]
+                    int read
+                    while ((read = is.read(buffer)) != -1) {
+                        sha256.update(buffer, 0, read)
+                    }
+                }
+                sha256File.text = sha256.digest().encodeHex().toString() + "  " + archive.name
+
+                // Generate SHA-512 checksum
+                def sha512File = new File("${archive}.sha512")
+                def sha512 = java.security.MessageDigest.getInstance("SHA-512")
+                archive.withInputStream { is ->
+                    def buffer = new byte[8192]
+                    int read
+                    while ((read = is.read(buffer)) != -1) {
+                        sha512.update(buffer, 0, read)
+                    }
+                }
+                sha512File.text = sha512.digest().encodeHex().toString() + "  " + archive.name
+            } else {
+                println "  ✗ Archive not found: ${archive.absolutePath}"
+            }
+        }
+    }
+}
+
+distTar.finalizedBy generateDistributionChecksums
+distZip.finalizedBy generateDistributionChecksums
+sourcesDistTar.finalizedBy generateDistributionChecksums
+sourcesDistZip.finalizedBy generateDistributionChecksums
+assembleDist.finalizedBy generateDistributionChecksums
+assembleSourcesDist.finalizedBy generateDistributionChecksums
