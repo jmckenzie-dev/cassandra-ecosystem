@@ -1,0 +1,392 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Analytics CI for the merged cassandra-ecosystem repo.
+#
+# This workflow ALWAYS triggers, but the heavy jobs only run when analytics/**
+# (or this workflow) changed — detected by the `changes` job. The `analytics-gate`
+# job always runs and is the ONLY context that branch protection should require.
+# Rationale: a workflow gated purely by `on.<event>.paths` is skipped wholesale on
+# unrelated PRs, leaving a required check stuck at "Expected — waiting for status"
+# and blocking merge. Running always + skipping heavy jobs internally keeps the
+# required gate reporting while still spending compute only on the changed project.
+# (See re-actors/alls-green + dorny/paths-filter.)
+#
+# All build/test commands are the analytics repo's originals, unchanged, run via
+# `defaults.run.working-directory: analytics`. Only non-`run` action paths (artifact
+# uploads, workspace cache) carry an explicit `analytics/` prefix, since
+# working-directory does not affect `uses:` steps.
+
+name: Analytics CI
+
+on:
+  push:
+    branches: [ "trunk" ]
+  pull_request:
+    branches: [ "trunk" ]
+  workflow_dispatch:
+
+concurrency:
+  group: analytics-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    working-directory: analytics
+
+jobs:
+  changes:
+    name: Detect analytics changes
+    runs-on: ubuntu-latest
+    outputs:
+      analytics: ${{ steps.filter.outputs.analytics }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            analytics:
+              - 'analytics/**'
+              - '.github/workflows/analytics-ci.yml'
+
+  build-jdk11:
+    name: Compile and build (JDK 11)
+    needs: changes
+    if: ${{ needs.changes.outputs.analytics == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: 11
+      - run: |
+          sudo apt-get update
+
+          if [ -f /etc/ssl/certs/java/cacerts/cacerts ]; then
+              sudo mv /etc/ssl/certs/java/cacerts/ /etc/ssl/certs/java/cacerts-old
+              sudo mv /etc/ssl/certs/java/cacerts-old/cacerts /etc/ssl/certs/java/
+              sudo rmdir /etc/ssl/certs/java/cacerts-old
+          fi
+
+          apt-get download ant ant-optional
+          sudo dpkg --force-all -i ant*.deb
+          rm ant*.deb
+
+          sudo bash -c 'for i in {2..20}; do echo 127.0.0.${i} localhost${i} >> /etc/hosts; done'
+
+          for i in {2..20}
+          do
+            sudo ip addr add "127.0.0.${i}" dev lo
+            sudo route add -host "127.0.0.${i}" dev lo;
+          done
+
+          export JDK_VERSION="11"
+          export SPARK_VERSION="3"
+          export SCALA_VERSION="2.12"
+          export CASSANDRA_USE_JDK11="true"
+
+          ./scripts/build-dependencies.sh
+
+          ./gradlew --no-daemon --max-workers=2 codeCheckTasks
+      - name: Cache Maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: maven-repo-jdk11-${{ github.sha }}
+      - name: Cache workspace
+        id: cache-build-save
+        uses: actions/cache/save@v4
+        with:
+          path: analytics
+          key: analytics-build-jdk11-${{ github.sha }}
+
+  # JDK17 dependency build for the Spark 4 / Scala 2.13 / Cassandra 5.0 matrix.
+  # Produces a distinct workspace cache (analytics-build-jdk17-...) so downstream test
+  # jobs must restore from exactly one of build-jdk11 / build-jdk17 — mixing them
+  # would clobber dependency jars.
+  build-jdk17:
+    name: Compile and build (JDK 17)
+    needs: changes
+    if: ${{ needs.changes.outputs.analytics == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: 17
+      - run: |
+          sudo apt-get update
+
+          if [ -f /etc/ssl/certs/java/cacerts/cacerts ]; then
+              sudo mv /etc/ssl/certs/java/cacerts/ /etc/ssl/certs/java/cacerts-old
+              sudo mv /etc/ssl/certs/java/cacerts-old/cacerts /etc/ssl/certs/java/
+              sudo rmdir /etc/ssl/certs/java/cacerts-old
+          fi
+
+          apt-get download ant ant-optional
+          sudo dpkg --force-all -i ant*.deb
+          rm ant*.deb
+
+          sudo bash -c 'for i in {2..20}; do echo 127.0.0.${i} localhost${i} >> /etc/hosts; done'
+
+          for i in {2..20}
+          do
+            sudo ip addr add "127.0.0.${i}" dev lo
+            sudo route add -host "127.0.0.${i}" dev lo;
+          done
+
+          export JDK_VERSION="17"
+          export SPARK_VERSION="4"
+          export SCALA_VERSION="2.13"
+          # JDK17 only targets Cassandra 5.0+; skip 4.0 / 4.1 dtest jar builds
+          # (build-dtest-jars.sh reads this var to filter CANDIDATE_BRANCHES).
+          export BRANCHES="cassandra-5.0"
+
+          ./scripts/build-dependencies.sh
+
+          ./gradlew codeCheckTasks
+      - name: Cache Maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: maven-repo-jdk17-${{ github.sha }}
+      - name: Cache workspace
+        id: cache-build-save
+        uses: actions/cache/save@v4
+        with:
+          path: analytics
+          key: analytics-build-jdk17-${{ github.sha }}
+
+  unit-test:
+    name: Unit test - Scala ${{ matrix.scala }} ${{ matrix.sstable-format }} C${{ matrix.cassandra }} Spark${{ matrix.spark }} JDK${{ matrix.jdk }}
+    # Each matrix entry only consumes one of these caches (selected by matrix.jdk),
+    # but `needs:` cannot be matrix-conditional so we wait on both builds.
+    needs: [changes, build-jdk11, build-jdk17]
+    if: ${{ needs.changes.outputs.analytics == 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - scala: '2.13'
+            sstable-format: 'bti'
+            cassandra: '5.0'
+            jdk: '11'
+            spark: '3'
+          - scala: '2.12'
+            sstable-format: 'big'
+            cassandra: '4.1'
+            jdk: '11'
+            spark: '3'
+          - scala: '2.12'
+            sstable-format: 'big'
+            cassandra: '4.0'
+            jdk: '11'
+            spark: '3'
+          - scala: '2.13'
+            sstable-format: 'bti'
+            cassandra: '5.0'
+            jdk: '17'
+            spark: '4'
+      fail-fast: false
+    steps:
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ matrix.jdk }}
+      - run: |
+          sudo bash -c 'for i in {2..20}; do echo 127.0.0.${i} localhost${i} >> /etc/hosts; done'
+          for i in {2..20}
+          do
+            sudo ip addr add "127.0.0.${i}" dev lo
+            sudo route add -host "127.0.0.${i}" dev lo;
+          done
+      - name: Cache Maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: maven-repo-jdk${{ matrix.jdk }}-${{ github.sha }}
+      - name: Cache workspace
+        id: cache-build-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: analytics
+          key: analytics-build-jdk${{ matrix.jdk }}-${{ github.sha }}
+      - run: |
+          export SPARK_VERSION="${{ matrix.spark }}"
+          export SCALA_VERSION="${{ matrix.scala }}"
+          export JDK_VERSION="${{ matrix.jdk }}"
+          export INTEGRATION_MAX_PARALLEL_FORKS=1
+          export INTEGRATION_MAX_HEAP_SIZE="3072M"
+          export CASSANDRA_VERSION="${{ matrix.cassandra }}"
+          if [ "${{ matrix.jdk }}" = "11" ]; then
+            export CASSANDRA_USE_JDK11=true
+          fi
+
+          ./gradlew --stacktrace clean assemble check -x cassandra-analytics-integration-tests:test -Dcassandra.analytics.bridges.sstable_format=${{ matrix.sstable-format }}
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-results-s${{ matrix.scala }}-${{ matrix.sstable-format }}-C${{ matrix.cassandra }}-Spark${{ matrix.spark }}-JDK${{ matrix.jdk }}
+          path: |
+            analytics/build/test-results/**
+            analytics/build/reports/tests/**
+          retention-days: 30
+
+  integration-test:
+    name: Integration test - ${{ matrix.config }} (${{ matrix.job_index }})
+    # Each matrix entry only consumes one of these caches (selected by matrix.jdk),
+    # but `needs:` cannot be matrix-conditional so we wait on both builds.
+    needs: [changes, build-jdk11, build-jdk17]
+    if: ${{ needs.changes.outputs.analytics == 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      # GitHub Actions generate a cross-product of 'config' × 'job_index' (4 × 5 = 20 jobs).
+      # The 'include' entries don't add new combinations — they augment existing ones
+      # by matching on 'config' and injecting 'scala', 'cassandra', 'jdk', and 'spark'
+      # into each match. To add a new version: add one entry to 'config' and one to
+      # 'include'.
+      matrix:
+        config: ['s2.13-c5.0.5', 's2.12-c4.1.4', 's2.12-c4.0.17', 's2.13-c5.0.5-spark4']
+        job_index: [0, 1, 2, 3, 4]
+        job_total: [5]
+        include:
+          - config: 's2.13-c5.0.5'
+            scala: '2.13'
+            cassandra: '5.0.5'
+            jdk: '11'
+            spark: '3'
+          - config: 's2.12-c4.1.4'
+            scala: '2.12'
+            cassandra: '4.1.4'
+            jdk: '11'
+            spark: '3'
+          - config: 's2.12-c4.0.17'
+            scala: '2.12'
+            cassandra: '4.0.17'
+            jdk: '11'
+            spark: '3'
+          - config: 's2.13-c5.0.5-spark4'
+            scala: '2.13'
+            cassandra: '5.0.5'
+            jdk: '17'
+            spark: '4'
+      fail-fast: false
+    steps:
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ matrix.jdk }}
+      - run: |
+          sudo bash -c 'for i in {2..20}; do echo 127.0.0.${i} localhost${i} >> /etc/hosts; done'
+          for i in {2..20}
+          do
+            sudo ip addr add "127.0.0.${i}" dev lo
+            sudo route add -host "127.0.0.${i}" dev lo;
+          done
+      - name: Cache Maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: maven-repo-jdk${{ matrix.jdk }}-${{ github.sha }}
+      - name: Cache workspace
+        id: cache-build-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: analytics
+          key: analytics-build-jdk${{ matrix.jdk }}-${{ github.sha }}
+      - run: |
+          export SPARK_VERSION="${{ matrix.spark }}"
+          export SCALA_VERSION="${{ matrix.scala }}"
+          export JDK_VERSION="${{ matrix.jdk }}"
+          export INTEGRATION_MAX_PARALLEL_FORKS=1
+          export INTEGRATION_MAX_HEAP_SIZE="3072M"
+          if [ "${{ matrix.jdk }}" = "11" ]; then
+            export CASSANDRA_USE_JDK11=true
+          fi
+
+          export DTEST_JAR="dtest-${{ matrix.cassandra }}.jar"
+          export CASSANDRA_VERSION=$(echo ${{ matrix.cassandra }} | cut -d'.' -f 1,2)
+
+          ./gradlew --stacktrace clean assemble
+
+          cd cassandra-analytics-integration-tests/src/test/java
+          # Shuffle test classes using the commit SHA as seed for reproducible randomization,
+          # then shard across runners via round-robin on the shuffled order.
+          CLASSNAMES=$(find . -name '*Test.java' | cut -c 3- | sed 's@/@.@g' | sed 's/.\{5\}$//' \
+            | python3 -c "import random,sys; lines=sys.stdin.read().splitlines(); random.seed('$GITHUB_SHA'); random.shuffle(lines); print('\n'.join(lines))" \
+            | awk 'NR % ${{ matrix.job_total }} == ${{ matrix.job_index }}')
+          cd ../../../..
+
+          EXIT_STATUS=0
+          # Execution of "gradle test --test $TEST_NAME" returns non-zero exit code when commend did not run any test
+          # (e.g. when all tests are ignored). Currently there is no option to change Gradle behaviour.
+          # Workaround the issue by explicitly skipping test classes that cannot be executed on Cassandra 4.0.
+          C40_EXCLUSIONS=("org.apache.cassandra.analytics.BulkWriteDownInstanceMultipleTokensTest" "org.apache.cassandra.analytics.BulkWriteDownSidecarMultipleTokensTest" "org.apache.cassandra.analytics.CassandraAnalyticsSimpleMultipleTokensTest" "org.apache.cassandra.analytics.RandomPartitionerTest" "org.apache.cassandra.analytics.testcontainer.BulkWriteS3CompatModeSimpleMultipleTokensTest" "org.apache.cassandra.analytics.data.ClearSnapshotTest")
+          for TEST_NAME in $CLASSNAMES; do
+            SKIP="false"
+            for C40_EXCLUSION in "${C40_EXCLUSIONS[@]}";
+            do
+              if [[ "$CASSANDRA_VERSION" == "4.0" && "$TEST_NAME" == ${C40_EXCLUSION} ]]; then
+                SKIP="true"
+                break
+              fi
+            done
+
+            test_id=$(date +%H%M%S)
+            mkdir -p "test-reports/$test_id/html"
+
+            if [ $SKIP == "false" ]; then
+              echo Executing test $TEST_NAME
+              ./gradlew --stacktrace cassandra-analytics-integration-tests:test --tests $TEST_NAME --no-daemon || EXIT_STATUS=$?;
+              find build/test-results -name "*.xml" -exec cp {} "test-reports/$test_id/" \; 2>/dev/null || true
+              [ -d "build/reports/tests" ] && cp -r build/reports/tests/. "test-reports/$test_id/html/" 2>/dev/null || true
+            else
+              echo "Skipping test $TEST_NAME"
+            fi
+          done;
+
+          exit $EXIT_STATUS
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-tests-${{ matrix.config }}-${{ matrix.job_index }}
+          path: analytics/test-reports/
+          retention-days: 30
+
+  # Always-runs aggregator. This is the ONLY analytics context to mark required in
+  # branch protection. allowed-skips lets the heavy jobs be skipped (unrelated PR)
+  # without stalling the required check; a job that RUNS and fails still fails the gate.
+  analytics-gate:
+    name: Analytics CI Gate
+    if: always()
+    needs: [changes, build-jdk11, build-jdk17, unit-test, integration-test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decide gate
+        uses: re-actors/alls-green@release/v1
+        with:
+          jobs: ${{ toJSON(needs) }}
+          allowed-skips: build-jdk11,build-jdk17,unit-test,integration-test

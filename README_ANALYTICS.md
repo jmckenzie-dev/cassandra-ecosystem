@@ -20,6 +20,10 @@
 
 # Cassandra Analytics 
 
+> **Part of [cassandra-ecosystem](README.md).** The Analytics sources live in the
+> [`analytics/`](analytics/) directory — run the build commands referenced below from
+> there (e.g. `cd analytics && ./gradlew ...`).
+
 ## Cassandra Spark Bulk Reader
 
 The open-source repository for the Cassandra Spark Bulk Reader. This library allows integration between Cassandra and Spark job, allowing users to run arbitrary Spark jobs against a Cassandra cluster securely and consistently. 
@@ -47,11 +51,11 @@ val df = sparkSession.read.format("org.apache.cassandra.spark.sparksql.Cassandra
 
 The Cassandra Spark Bulk Writer allows for high-speed data ingest to Cassandra clusters running Cassandra 4.x and 5.0.
 
-Developers interested in contributing to the Analytics library, please see the [DEV-README](DEV-README.md).
+Developers interested in contributing to the Analytics library, please see the [DEV-README](analytics/DEV-README.md).
 
 ## Getting Started
 
-For example usage, see the [example repository](cassandra-analytics-core-example/README.md). This example covers both
+For example usage, see the [example repository](analytics/cassandra-analytics-core-example/README.md). This example covers both
 setting up Cassandra 4.0, Apache Sidecar, and running a Spark Bulk Reader and Spark Bulk Writer job.
 
 ## Contributing

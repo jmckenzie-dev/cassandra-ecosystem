@@ -1,0 +1,10 @@
+Apache Cassandra Ecosystem
+Copyright 2023- The Apache Software Foundation
+
+This product includes software developed by The Apache Software
+Foundation (http://www.apache.org/).
+
+This repository aggregates multiple Apache Cassandra companion products, each of
+which carries its own NOTICE with additional attributions:
+  - Analytics: see analytics/NOTICE.txt
+  - Sidecar:   see sidecar/NOTICE.txt

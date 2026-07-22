@@ -1,0 +1,663 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# Sidecar CI for the merged cassandra-ecosystem repo.
+#
+# Same pattern as analytics-ci.yml: the workflow ALWAYS triggers, heavy jobs run
+# only when sidecar/** (or this file) changed (the `changes` job), and `sidecar-gate`
+# always runs and is the ONLY context branch protection should require. See the header
+# of analytics-ci.yml for the full rationale (path-filtered required checks stall PRs).
+#
+# Commands are the sidecar repo's originals, unchanged, run via
+# `defaults.run.working-directory: sidecar`. Because `working-directory` does NOT apply
+# to `uses:` steps or to workspace-relative expressions, every artifact path,
+# hashFiles() arg, and CASSANDRA_DEP_DIR carries an explicit `sidecar/` prefix — the
+# build produces dtest-jars/, cassandra-tarballs/, and build/ under sidecar/.
+
+name: Sidecar CI
+
+on:
+  pull_request:
+    branches: [trunk]
+  push:
+    branches: [trunk]
+
+# Cancel in-progress runs for PRs when new commits are pushed
+concurrency:
+  group: sidecar-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: sidecar
+
+jobs:
+  changes:
+    name: Detect sidecar changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      sidecar: ${{ steps.filter.outputs.sidecar }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            sidecar:
+              - 'sidecar/**'
+              - '.github/workflows/sidecar-ci.yml'
+
+  # Build Cassandra dtest jars once for all test jobs to reuse
+  build-dtest-jars:
+    name: Build dtest jars
+    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ needs.changes.outputs.sidecar == 'true' }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Java 11
+        uses: actions/setup-java@v5
+        with:
+          java-version: "11"
+          distribution: "temurin"
+          cache: "gradle"
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ant
+
+      - name: Setup network aliases for multi-node tests
+        run: |
+          for i in {2..20}; do
+            sudo ip addr add 127.0.0.$i/8 dev lo
+          done
+
+      - name: Cache dtest jars
+        id: cache-dtest-jars
+        uses: actions/cache@v4
+        with:
+          path: |
+            sidecar/dtest-jars/
+            sidecar/cassandra-tarballs/
+          key: dtest-jars-${{ hashFiles('sidecar/scripts/build-dtest-jars.sh', 'sidecar/gradle/wrapper/gradle-wrapper.properties') }}
+
+      - name: Dtest jars cache status
+        run: |
+          if [ "${{ steps.cache-dtest-jars.outputs.cache-hit }}" == "true" ]; then
+            echo "✅ Dtest jars restored from cache (saves ~25 minutes)"
+          else
+            echo "⚠️ Cache miss - will build dtest jars (~25 minutes)"
+          fi
+
+      - name: Build dtest jars
+        if: steps.cache-dtest-jars.outputs.cache-hit != 'true'
+        run: |
+          ./scripts/build-dtest-jars.sh
+
+      - name: Upload dtest jars artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: dtest-jars
+          path: sidecar/dtest-jars/
+          retention-days: 90
+
+      - name: Upload cassandra tarballs artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: cassandra-tarballs
+          path: sidecar/cassandra-tarballs/
+          retention-days: 30
+
+  # Run checkstyle checks for code style validation
+  checkstyle:
+    name: Checkstyle
+    runs-on: ubuntu-latest
+    needs: [changes, build-dtest-jars]
+    if: ${{ needs.changes.outputs.sidecar == 'true' }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Java 11
+        uses: actions/setup-java@v5
+        with:
+          java-version: "11"
+          distribution: "temurin"
+          cache: "gradle"
+
+
+      - name: Download dtest jars
+        uses: actions/download-artifact@v5
+        with:
+          name: dtest-jars
+          path: sidecar/dtest-jars/
+
+      - name: Run checkstyle
+        run: |
+          ./gradlew checkstyle --stacktrace
+        env:
+          CASSANDRA_DEP_DIR: ${{ github.workspace }}/sidecar/dtest-jars
+
+      - name: Upload checkstyle reports
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: checkstyle-reports
+          path: "sidecar/**/build/reports/checkstyle/"
+          retention-days: 30
+
+  # Run unit tests with static analysis on all Java versions
+  unit-tests:
+    name: Unit tests (Java ${{ matrix.java }})
+    runs-on: ubuntu-latest
+    needs: [changes, build-dtest-jars]
+    if: ${{ needs.changes.outputs.sidecar == 'true' }}
+    permissions:
+      contents: read
+      checks: write
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ["11", "17"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Java ${{ matrix.java }}
+        uses: actions/setup-java@v5
+        with:
+          java-version: ${{ matrix.java }}
+          distribution: "temurin"
+          cache: "gradle"
+
+
+      - name: Download dtest jars
+        uses: actions/download-artifact@v5
+        with:
+          name: dtest-jars
+          path: sidecar/dtest-jars/
+
+      - name: Run build with static analysis
+        run: |
+          ./gradlew build -x integrationTest -x checkstyleMain -x checkstyleTest -x checkstyleTestFixtures -x javadoc --stacktrace
+        env:
+          CASSANDRA_DEP_DIR: ${{ github.workspace }}/sidecar/dtest-jars
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: unit-test-results-java-${{ matrix.java }}
+          path: |
+            sidecar/build/test-results/**
+            sidecar/build/reports/tests/**
+          retention-days: 30
+
+      - name: Upload static analysis reports
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: static-analysis-reports-java-${{ matrix.java }}
+          path: |
+            sidecar/**/build/reports/spotbugs/
+            sidecar/**/build/reports/rat/
+            sidecar/**/build/reports/jacoco/
+          retention-days: 30
+
+  # Run lightweight integration tests on full matrix
+  integration-tests-lightweight:
+    name: Integration tests lightweight (Java ${{ matrix.java }}, C* ${{ matrix.cassandra }})
+    runs-on: ubuntu-latest
+    needs: [changes, build-dtest-jars, unit-tests]
+    if: ${{ needs.changes.outputs.sidecar == 'true' }}
+    permissions:
+      contents: read
+      checks: write
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ["11", "17"]
+        cassandra: ["4.0", "4.1", "5.0", "5.1"]
+        include:
+          - cassandra: "4.0"
+            dtestVersion: "4.0.20"
+          - cassandra: "4.1"
+            dtestVersion: "4.1.11"
+          - cassandra: "5.0"
+            dtestVersion: "5.0.6"
+          - cassandra: "5.1"
+            dtestVersion: "5.1"
+        # Exclude jdk17 for 4.0/4.1 as they don't support 17
+        exclude:
+          - cassandra: "4.0"
+            java: "17"
+          - cassandra: "4.1"
+            java: "17"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Java ${{ matrix.java }}
+        uses: actions/setup-java@v5
+        with:
+          java-version: ${{ matrix.java }}
+          distribution: "temurin"
+          cache: "gradle"
+
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ant
+
+      - name: Setup network aliases for multi-node tests
+        run: |
+          for i in {2..20}; do
+            sudo ip addr add 127.0.0.$i/8 dev lo
+            sudo echo 127.0.0.${i} localhost${i} | sudo tee -a /etc/hosts
+          done
+
+      - name: Download dtest jars
+        uses: actions/download-artifact@v5
+        with:
+          name: dtest-jars
+          path: sidecar/dtest-jars/
+
+      - name: Install dtest jars to local Maven
+        run: |
+          ./scripts/install-shaded-dtest-jar-local.sh
+        env:
+          CASSANDRA_DEP_DIR: ${{ github.workspace }}/sidecar/dtest-jars
+
+      - name: Run lightweight integration tests
+        run: |
+          ./gradlew --no-daemon \
+            -PdtestVersion=${{ matrix.dtestVersion }} \
+            -Dcassandra.sidecar.versions_to_test="${{ matrix.cassandra }}" \
+            spotbugsIntegrationTest integrationTestLightWeight \
+            --stacktrace
+        env:
+          CASSANDRA_DEP_DIR: ${{ github.workspace }}/sidecar/dtest-jars
+          INTEGRATION_MAX_PARALLEL_FORKS: 3
+          INTEGRATION_MAX_HEAP_SIZE: 2500M
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: integration-lightweight-results-java-${{ matrix.java }}-cassandra-${{ matrix.cassandra }}
+          path: |
+            sidecar/build/test-results/**
+            sidecar/build/reports/tests/**
+          retention-days: 30
+
+  # Run heavyweight integration tests on full matrix
+  integration-tests-heavyweight:
+    name: Integration tests heavyweight (Java ${{ matrix.java }}, C* ${{ matrix.cassandra }})
+    runs-on: ubuntu-latest
+    needs: [changes, build-dtest-jars, unit-tests]
+    if: ${{ needs.changes.outputs.sidecar == 'true' }}
+    permissions:
+      contents: read
+      checks: write
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ["11", "17"]
+        cassandra: ["4.0", "4.1", "5.0", "5.1"]
+        include:
+          - cassandra: "4.0"
+            dtestVersion: "4.0.16"
+          - cassandra: "4.1"
+            dtestVersion: "4.1.6"
+          - cassandra: "5.0"
+            dtestVersion: "5.0.3"
+          - cassandra: "5.1"
+            dtestVersion: "5.1"
+        # Exclude jdk17 for 4.0/4.1 as they don't support 17
+        exclude:
+          - cassandra: "4.0"
+            java: "17"
+          - cassandra: "4.1"
+            java: "17"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Java ${{ matrix.java }}
+        uses: actions/setup-java@v5
+        with:
+          java-version: ${{ matrix.java }}
+          distribution: "temurin"
+          cache: "gradle"
+
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ant
+
+      - name: Setup network aliases for multi-node tests
+        run: |
+          for i in {2..20}; do
+            sudo ip addr add 127.0.0.$i/8 dev lo
+            sudo echo 127.0.0.${i} localhost${i} | sudo tee -a /etc/hosts
+          done
+          cat /etc/hosts
+
+      - name: Download dtest jars
+        uses: actions/download-artifact@v5
+        with:
+          name: dtest-jars
+          path: sidecar/dtest-jars/
+
+      - name: Download cassandra tarballs
+        uses: actions/download-artifact@v5
+        with:
+          name: cassandra-tarballs
+          path: sidecar/cassandra-tarballs/
+
+      - name: Install dtest jars to local Maven
+        run: |
+          ./scripts/install-shaded-dtest-jar-local.sh
+        env:
+          CASSANDRA_DEP_DIR: ${{ github.workspace }}/sidecar/dtest-jars
+
+      - name: Run heavyweight integration tests
+        run: |
+          ./gradlew --no-daemon \
+            -PdtestVersion=${{ matrix.dtestVersion }} \
+            -PtarballVersion=${{ matrix.cassandra }} \
+            -Dcassandra.sidecar.versions_to_test="${{ matrix.cassandra }}" \
+            jar integrationTestHeavyWeight \
+            --stacktrace
+        env:
+          CASSANDRA_DEP_DIR: ${{ github.workspace }}/sidecar/dtest-jars
+          INTEGRATION_MAX_PARALLEL_FORKS: 3
+          INTEGRATION_MAX_HEAP_SIZE: 3600M
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: integration-heavyweight-results-java-${{ matrix.java }}-cassandra-${{ matrix.cassandra }}
+          path: |
+            sidecar/build/test-results/**
+            sidecar/build/reports/tests/**
+          retention-days: 30
+
+  # Run Java 8 client unit tests for client compatibility
+  unit-tests-java8:
+    name: Unit tests (Java 8 - Client only)
+    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ needs.changes.outputs.sidecar == 'true' }}
+    permissions:
+      contents: read
+      checks: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Java 8
+        uses: actions/setup-java@v5
+        with:
+          java-version: "8"
+          distribution: "temurin"
+          cache: "gradle"
+
+
+      - name: Run build
+        run: |
+          ./gradlew build --stacktrace
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: unit-test-results-java-8
+          path: |
+            sidecar/build/test-results/**
+            sidecar/build/reports/tests/**
+          retention-days: 30
+
+  # Build and verify Debian package
+  deb-build-install:
+    name: Deb package build and install
+    runs-on: ubuntu-latest
+    needs: [changes, unit-tests, checkstyle]
+    if: ${{ needs.changes.outputs.sidecar == 'true' }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Java 11
+        uses: actions/setup-java@v5
+        with:
+          java-version: "11"
+          distribution: "temurin"
+          cache: "gradle"
+
+
+      - name: Build Debian package
+        run: |
+          ./gradlew --parallel clean buildDeb \
+            -x test -x integrationTest \
+            -x rat \
+            -x checkstyleMain -x checkstyleTest -x checkstyleTestFixtures \
+            -x spotbugsMain -x spotbugsTest \
+            -x javadoc \
+            -x asciidoctor -x copyDocs
+
+      - name: Install Debian package
+        run: |
+          sudo apt-get update && sudo apt --fix-broken install
+          DEBIAN_FRONTEND=noninteractive sudo apt install -y ./build/distributions/apache-cassandra-sidecar*.deb
+
+      - name: Verify installation
+        run: |
+          test -f /opt/apache-cassandra-sidecar/bin/cassandra-sidecar
+          test -f /opt/apache-cassandra-sidecar/conf/sidecar.yaml
+          test -f /opt/apache-cassandra-sidecar/conf/logback.xml
+          test -f /opt/apache-cassandra-sidecar/LICENSE.txt
+          test -f /opt/apache-cassandra-sidecar/lib/cassandra-sidecar-*.jar
+
+      - name: Verify DEB package version
+        run: |
+          EXPECTED_UPSTREAM=$(grep "^version=" gradle.properties | cut -d'=' -f2 | tr '-' '~')
+          ACTUAL_VERSION=$(dpkg-query -W -f='${Version}' apache-cassandra-sidecar)
+          ACTUAL_UPSTREAM="${ACTUAL_VERSION%-*}"
+          ACTUAL_REVISION="${ACTUAL_VERSION##*-}"
+          echo "DEB: upstream=${ACTUAL_UPSTREAM}, revision=${ACTUAL_REVISION}, expected upstream=${EXPECTED_UPSTREAM}"
+          if [ -z "${ACTUAL_REVISION}" ] || [ "${ACTUAL_REVISION}" = "${ACTUAL_VERSION}" ]; then
+            echo "DEB has no Debian revision — yields trailing '-' style bug"
+            exit 1
+          fi
+          if [ "${ACTUAL_UPSTREAM}" != "${EXPECTED_UPSTREAM}" ]; then
+            echo "DEB upstream version mismatch: expected '${EXPECTED_UPSTREAM}', got '${ACTUAL_UPSTREAM}'"
+            exit 1
+          fi
+
+  # Build and verify RPM package
+  rpm-build-install:
+    name: RPM package build and install
+    runs-on: ubuntu-latest
+    needs: [changes, unit-tests, checkstyle]
+    if: ${{ needs.changes.outputs.sidecar == 'true' }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Java 11
+        uses: actions/setup-java@v5
+        with:
+          java-version: "11"
+          distribution: "temurin"
+          cache: "gradle"
+
+
+      - name: Install dnf
+        run: |
+          sudo apt-get update && sudo apt-get install -y dnf rpm
+
+      - name: Build RPM package
+        run: |
+          ./gradlew --parallel buildRpm \
+            -x test -x integrationTest \
+            -x rat \
+            -x checkstyleMain -x checkstyleTest -x checkstyleTestFixtures \
+            -x spotbugsMain -x spotbugsTest \
+            -x javadoc \
+            -x asciidoctor -x copyDocs
+
+      - name: Install RPM package
+        run: |
+          sudo dnf install -y ./build/distributions/apache-cassandra-sidecar*.rpm
+
+      - name: Verify installation
+        run: |
+          test -f /opt/apache-cassandra-sidecar/bin/cassandra-sidecar
+          test -f /opt/apache-cassandra-sidecar/conf/sidecar.yaml
+          test -f /opt/apache-cassandra-sidecar/conf/logback.xml
+          test -f /opt/apache-cassandra-sidecar/LICENSE.txt
+          test -f /opt/apache-cassandra-sidecar/lib/cassandra-sidecar-*.jar
+
+      - name: Verify RPM package version
+        run: |
+          EXPECTED_VERSION=$(grep "^version=" gradle.properties | cut -d'=' -f2 | tr '-' '~')
+          RPM_FILE=$(ls build/distributions/apache-cassandra-sidecar*.rpm | head -n1)
+          echo "Querying: ${RPM_FILE}"
+          ACTUAL_VERSION=$(rpm -qp --queryformat '%{VERSION}' "${RPM_FILE}")
+          ACTUAL_RELEASE=$(rpm -qp --queryformat '%{RELEASE}' "${RPM_FILE}")
+          echo "RPM: version=${ACTUAL_VERSION}, release=${ACTUAL_RELEASE}, expected=${EXPECTED_VERSION}"
+          if [ -z "${ACTUAL_RELEASE}" ] || [ "${ACTUAL_RELEASE}" = "(none)" ]; then
+            echo "RPM Release is empty — yields trailing '-' in 'yum list'"
+            exit 1
+          fi
+          if [ "${ACTUAL_VERSION}" != "${EXPECTED_VERSION}" ]; then
+            echo "RPM Version mismatch: expected '${EXPECTED_VERSION}', got '${ACTUAL_VERSION}'"
+            exit 1
+          fi
+
+  # Build Docker image
+  docker-build:
+    name: Docker build
+    runs-on: ubuntu-latest
+    needs: [changes, unit-tests, checkstyle]
+    if: ${{ needs.changes.outputs.sidecar == 'true' }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Java 11
+        uses: actions/setup-java@v5
+        with:
+          java-version: "11"
+          distribution: "temurin"
+          cache: "gradle"
+
+
+      - name: Build Docker image with Jib
+        run: |
+          IMAGE_CREATED=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          VERSION=$(grep "^version=" gradle.properties | cut -d'=' -f2)
+          ./gradlew --info clean :server:jibDockerBuild \
+            "-Doci.image.revision=${{ github.sha }}" \
+            "-Doci.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            "-Doci.image.created=${IMAGE_CREATED}" \
+            "-Doci.image.version=${VERSION}"
+
+  # Build documentation
+  docs-build:
+    name: Documentation build
+    runs-on: ubuntu-latest
+    needs: [changes, unit-tests, checkstyle]
+    if: ${{ needs.changes.outputs.sidecar == 'true' }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Java 11
+        uses: actions/setup-java@v5
+        with:
+          java-version: "11"
+          distribution: "temurin"
+          cache: "gradle"
+
+
+      - name: Build documentation
+        run: |
+          ./gradlew docs:asciidoctor
+
+      - name: Verify documentation
+        run: |
+          test -f docs/build/user.html
+          test -f docs/build/development.html
+
+  # Always-runs aggregator. This is the ONLY sidecar context to mark required in
+  # branch protection. See analytics-ci.yml header for rationale.
+  sidecar-gate:
+    name: Sidecar CI Gate
+    if: always()
+    needs:
+      - changes
+      - build-dtest-jars
+      - checkstyle
+      - unit-tests
+      - integration-tests-lightweight
+      - integration-tests-heavyweight
+      - unit-tests-java8
+      - deb-build-install
+      - rpm-build-install
+      - docker-build
+      - docs-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decide gate
+        uses: re-actors/alls-green@release/v1
+        with:
+          jobs: ${{ toJSON(needs) }}
+          allowed-skips: build-dtest-jars,checkstyle,unit-tests,integration-tests-lightweight,integration-tests-heavyweight,unit-tests-java8,deb-build-install,rpm-build-install,docker-build,docs-build

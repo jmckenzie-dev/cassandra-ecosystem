@@ -20,6 +20,11 @@
 
 # Apache Cassandra Sidecar
 
+> **Part of [cassandra-ecosystem](README.md).** The Sidecar sources live in the
+> [`sidecar/`](sidecar/) directory — run all the commands below from there
+> (e.g. `cd sidecar && ./gradlew run`). Paths like `conf/sidecar.yaml`,
+> `scripts/`, and `examples/` are relative to `sidecar/`.
+
 This is a Sidecar for the highly scalable Apache Cassandra database.
 For more information, see [the Apache Cassandra web site](http://cassandra.apache.org/) and [CIP-1](https://cwiki.apache.org/confluence/pages/viewpage.action?pageId=95652224).
 
@@ -86,7 +91,7 @@ as follows:
 
     $ ./gradlew run -Dsidecar.config=file:///$PWD/examples/conf/sidecar-ccm.yaml
 
-Please see [samples](samples/README.md) for details.
+Please see [samples](sidecar/samples/README.md) for details.
 
 Configuring Cassandra Instance
 ------------------------------
@@ -311,7 +316,7 @@ do not replace the CircleCI config, choose the option to do it manually.  Circle
 Contributing
 ------------
 
-We warmly welcome and appreciate contributions from the community. Please see [CONTRIBUTING.md](CONTRIBUTING.md)
+We warmly welcome and appreciate contributions from the community. Please see [CONTRIBUTING.md](sidecar/CONTRIBUTING.md)
 if you wish to submit pull requests.
 
 Wondering where to go from here?
