@@ -1,0 +1,121 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+// Thin top-level orchestration for the cassandra-ecosystem repo.
+//
+// analytics/ and sidecar/ are independent Gradle builds, each with its own wrapper
+// and toolchain. This root build does NOT include them (no include / includeBuild) —
+// every task below just shells into the relevant child wrapper. It is pure syntactic
+// sugar; nothing inside either build changes. See CEP-63 Phase 1 / README.md.
+//
+// Toolchain env (JDK_VERSION / SPARK_VERSION / SCALA_VERSION / JAVA_HOME) is inherited
+// by the child process, so `SPARK_VERSION=4 ./gradlew analyticsJar` works as expected.
+// The mac convenience scripts build_analytics.sh / build_sidecar.sh still own JDK
+// auto-selection; the *Deps tasks reuse the children's own scripts/ presteps.
+
+def gradlewFor(String subdir) {
+    // Windows would need gradlew.bat; the repo ships only the POSIX wrapper today.
+    return './gradlew'
+}
+
+// Register an Exec task that runs a child gradlew with the given args.
+def proxy(String name, String taskGroup, String subdir, List<String> args) {
+    tasks.register(name, Exec) {
+        it.group = taskGroup
+        it.description = "${subdir}/: ${gradlewFor(subdir)} ${args.join(' ')}"
+        it.workingDir = file(subdir)
+        it.commandLine([gradlewFor(subdir), '--no-daemon'] + args)
+    }
+}
+
+// Register an Exec task that runs an arbitrary child script (e.g. dep presteps).
+def script(String name, String taskGroup, String subdir, String scriptPath, String desc) {
+    tasks.register(name, Exec) {
+        it.group = taskGroup
+        it.description = desc
+        it.workingDir = file(subdir)
+        it.commandLine(scriptPath)
+    }
+}
+
+// ---- analytics -------------------------------------------------------------
+def A = 'analytics'
+proxy('analyticsClean',           A, 'analytics', ['clean'])
+proxy('analyticsJar',             A, 'analytics', ['assemble'])
+proxy('analyticsCheck',           A, 'analytics', ['check'])
+proxy('analyticsTest',            A, 'analytics', ['test'])
+proxy('analyticsIntegrationTest', A, 'analytics', [':cassandra-analytics-integration-tests:test'])
+proxy('analyticsDist',            A, 'analytics', ['distTar', 'distZip'])
+script('analyticsDeps',           A, 'analytics', './scripts/build-dependencies.sh',
+        'analytics/: build dtest-jar dependencies (network; run before integration tests)')
+
+// ---- sidecar ---------------------------------------------------------------
+def S = 'sidecar'
+proxy('sidecarClean',             S, 'sidecar', ['clean'])
+proxy('sidecarJar',               S, 'sidecar', ['assemble'])
+proxy('sidecarCheck',             S, 'sidecar', ['check'])
+proxy('sidecarTest',              S, 'sidecar', ['test'])
+proxy('sidecarIntegrationTest',   S, 'sidecar', [':integration-tests:integrationTest'])
+proxy('sidecarDist',              S, 'sidecar', ['distTar', 'distZip'])
+script('sidecarDeps',             S, 'sidecar', './scripts/build-dtest-jars.sh',
+        'sidecar/: build dtest jars (network; run before integration tests)')
+
+// ---- combined (both projects) ----------------------------------------------
+def E = 'ecosystem'
+tasks.register('clean') { group = E; description = 'Clean both projects';    dependsOn 'analyticsClean', 'sidecarClean' }
+tasks.register('jar')   { group = E; description = 'Assemble both projects'; dependsOn 'analyticsJar',   'sidecarJar' }
+tasks.register('check') { group = E; description = 'Check both projects';    dependsOn 'analyticsCheck', 'sidecarCheck' }
+tasks.register('test')  { group = E; description = 'Unit-test both projects'; dependsOn 'analyticsTest', 'sidecarTest' }
+tasks.register('dist')  { group = E; description = 'Build distributions for both projects'; dependsOn 'analyticsDist', 'sidecarDist' }
+
+// ---- lock-step version (ported from the old Makefile) ----------------------
+// Both projects are stamped with the SAME version (CEP-63 §4). A release that changes
+// only one project still bumps the other — note that in the release notes.
+def versionFiles = [file('analytics/gradle.properties'), file('sidecar/gradle.properties')]
+
+tasks.register('printVersion') {
+    group = E
+    description = "Show each project's current version"
+    doLast {
+        versionFiles.each { f ->
+            def line = f.readLines().find { it.startsWith('version=') } ?: 'version=<none>'
+            println "${f.parentFile.name}: ${line}"
+        }
+    }
+}
+
+tasks.register('setVersion') {
+    group = E
+    description = 'Stamp both projects to one version (lock-step). Usage: -Pversion=x.y.z'
+    doLast {
+        // project.version defaults to 'unspecified' when -Pversion is not supplied.
+        def v = project.version?.toString()
+        if (!v || v == 'unspecified') {
+            throw new GradleException('Usage: ./gradlew setVersion -Pversion=x.y.z')
+        }
+        versionFiles.each { f ->
+            def updated = f.text.replaceFirst(/(?m)^version=.*$/, "version=${v}")
+            f.text = updated
+        }
+        println "Stamped both projects to ${v}:"
+        versionFiles.each { f ->
+            println "${f.parentFile.name}: " + (f.readLines().find { it.startsWith('version=') })
+        }
+    }
+}

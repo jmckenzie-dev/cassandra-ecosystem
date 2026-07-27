@@ -31,3 +31,5 @@ Thumbs.db
 
 # Gradle
 .gradle/
+# Root orchestration build output (anchored so it doesn't shadow analytics/ or sidecar/).
+/build/

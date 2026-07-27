@@ -49,27 +49,35 @@ large). Cassandra core does **not** live here.
 
 ## Building
 
-Build each project from its own directory:
+A thin top-level Gradle wrapper delegates into each project's own build, so you can drive both
+from the repo root. Tasks are grouped `analytics*`, `sidecar*`, and combined:
 
 ```bash
-# Analytics (default profile: Spark 3 / Scala 2.12 / JDK 11; override via env vars)
-cd analytics && ./gradlew build
-
-# Sidecar (Java 11 server; requires dtest jars — see sidecar docs)
-cd sidecar && ./gradlew build
+./gradlew analyticsJar          # assemble analytics only
+./gradlew sidecarJar            # assemble sidecar only
+./gradlew jar                   # assemble both
+./gradlew check                 # static analysis on both
+./gradlew test                  # unit tests on both
+./gradlew clean                 # clean both
+./gradlew tasks                 # list all analytics/sidecar/ecosystem tasks
 ```
 
+The root build is pure orchestration — it never couples the two builds; each task just runs the
+child project's own `./gradlew`. You can still build a project directly from its own directory
+(`cd analytics && ./gradlew build`).
+
 The analytics build profile is selected with the `SPARK_VERSION`, `SCALA_VERSION`, and
-`JDK_VERSION` environment variables (e.g. `SPARK_VERSION=4 SCALA_VERSION=2.13 JDK_VERSION=17`).
-A thin top-level [`Makefile`](Makefile) provides convenience targets (`make build-analytics`,
-`make build-sidecar`, `make build-all`, `make release VERSION=x.y.z`) that delegate into each
-subdirectory.
+`JDK_VERSION` environment variables (e.g. `SPARK_VERSION=4 SCALA_VERSION=2.13 JDK_VERSION=17`);
+these pass straight through to the child build. Integration tests need dtest jars first — run
+`./gradlew analyticsDeps` / `./gradlew sidecarDeps` (network) before
+`./gradlew analyticsIntegrationTest` / `sidecarIntegrationTest`.
 
 ## Versioning & releases
 
 All modules share a single, lock-step version line (both projects are currently
-`0.5-SNAPSHOT`). A release stamps the same version into both `analytics/gradle.properties` and
-`sidecar/gradle.properties`; a release that only changes one project still bumps the other
+`0.5-SNAPSHOT`). `./gradlew setVersion -Pversion=x.y.z` stamps the same version into both
+`analytics/gradle.properties` and `sidecar/gradle.properties` (`./gradlew printVersion` shows
+the current values); a release that only changes one project still bumps the other
 (noted in release notes). **Published artifact names and coordinates are unchanged** by the
 merge — analytics artifacts keep their `..._sparkN_scala` suffixes and sidecar keeps its
 `sidecar-*` names.
