@@ -118,13 +118,13 @@ jobs:
           git push --delete origin sidecar-test-artifacts || true
 
       - name: Create test artifacts release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: sidecar-test-artifacts
-          name: "Sidecar Test Artifacts - ${{ steps.version.outputs.build_date }}"
-          prerelease: true
-          draft: false
-          body: |
+        # ponytail: `gh release create` instead of softprops/action-gh-release — the ASF
+        # org allowlist only permits GitHub-owned and explicitly allowlisted actions.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_NAME: "Sidecar Test Artifacts - ${{ steps.version.outputs.build_date }}"
+          TARBALL: apache-cassandra-sidecar-${{ steps.version.outputs.test_version }}.tar.gz
+          NOTES: |
             ## Sidecar Test Artifacts (Not an Official Release)
 
             **⚠️ These are automated test artifacts built after successful CI runs. They are NOT official releases.**
@@ -176,5 +176,11 @@ jobs:
             ---
 
             **Note**: These are test artifacts, not official releases. Do not use in production.
-          files: |
-            sidecar/apache-cassandra-sidecar-${{ steps.version.outputs.test_version }}.tar.gz
+        run: |
+          printf '%s' "$NOTES" > "$RUNNER_TEMP/release-notes.md"
+          gh release create sidecar-test-artifacts "$TARBALL" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_NAME" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --prerelease

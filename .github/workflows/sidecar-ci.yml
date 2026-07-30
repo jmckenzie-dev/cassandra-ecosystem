@@ -59,13 +59,28 @@ jobs:
       sidecar: ${{ steps.filter.outputs.sidecar }}
     steps:
       - uses: actions/checkout@v5
-      - uses: dorny/paths-filter@v3
-        id: filter
         with:
-          filters: |
-            sidecar:
-              - 'sidecar/**'
-              - '.github/workflows/sidecar-ci.yml'
+          fetch-depth: 0
+      - id: filter
+        working-directory: .
+        # ponytail: inline git diff instead of dorny/paths-filter — ASF org only
+        # permits GitHub-owned and explicitly allowlisted third-party actions.
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          base="$BASE_SHA"
+          # No usable base (workflow_dispatch, branch creation, force push): build everything.
+          if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            echo "sidecar=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --name-only "$base" "$HEAD_SHA" \
+               | grep -qE '^(sidecar/|\.github/workflows/sidecar-ci\.yml$)'; then
+            echo "sidecar=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "sidecar=false" >> "$GITHUB_OUTPUT"
+          fi
 
   # Build Cassandra dtest jars once for all test jobs to reuse
   build-dtest-jars:
@@ -657,7 +672,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Decide gate
-        uses: re-actors/alls-green@release/v1
-        with:
-          jobs: ${{ toJSON(needs) }}
-          allowed-skips: build-dtest-jars,checkstyle,unit-tests,integration-tests-lightweight,integration-tests-heavyweight,unit-tests-java8,deb-build-install,rpm-build-install,docker-build,docs-build
+        # ponytail: inline jq instead of re-actors/alls-green (not ASF-allowlisted).
+        # Every heavy job is skippable, so only failure/cancelled fails the gate.
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS"
+          bad=$(printf '%s' "$NEEDS" | jq -r \
+            'to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | .key')
+          if [ -n "$bad" ]; then
+            echo "Gate failed. Jobs failed or cancelled:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "Gate passed."
