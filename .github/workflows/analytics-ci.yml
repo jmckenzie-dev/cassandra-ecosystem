@@ -213,6 +213,9 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: ${{ matrix.jdk }}
+      # No checkout: analytics/ is materialized by the workspace cache restore below.
+      # This step is host setup only, so it must NOT inherit working-directory: analytics
+      # (that dir does not exist yet and bash would fail to cd into it).
       - run: |
           sudo bash -c 'for i in {2..20}; do echo 127.0.0.${i} localhost${i} >> /etc/hosts; done'
           for i in {2..20}
@@ -220,6 +223,7 @@ jobs:
             sudo ip addr add "127.0.0.${i}" dev lo
             sudo route add -host "127.0.0.${i}" dev lo;
           done
+        working-directory: .
       - name: Cache Maven repository
         uses: actions/cache@v4
         with:
@@ -231,6 +235,9 @@ jobs:
         with:
           path: analytics
           key: analytics-build-jdk${{ matrix.jdk }}-${{ github.sha }}
+          # Without the cache there is no source tree at all; fail with that message
+          # rather than a confusing "./gradlew: no such file" 20 lines later.
+          fail-on-cache-miss: true
       - run: |
           export SPARK_VERSION="${{ matrix.spark }}"
           export SCALA_VERSION="${{ matrix.scala }}"
@@ -298,6 +305,9 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: ${{ matrix.jdk }}
+      # No checkout: analytics/ is materialized by the workspace cache restore below.
+      # This step is host setup only, so it must NOT inherit working-directory: analytics
+      # (that dir does not exist yet and bash would fail to cd into it).
       - run: |
           sudo bash -c 'for i in {2..20}; do echo 127.0.0.${i} localhost${i} >> /etc/hosts; done'
           for i in {2..20}
@@ -305,6 +315,7 @@ jobs:
             sudo ip addr add "127.0.0.${i}" dev lo
             sudo route add -host "127.0.0.${i}" dev lo;
           done
+        working-directory: .
       - name: Cache Maven repository
         uses: actions/cache@v4
         with:
@@ -316,6 +327,9 @@ jobs:
         with:
           path: analytics
           key: analytics-build-jdk${{ matrix.jdk }}-${{ github.sha }}
+          # Without the cache there is no source tree at all; fail with that message
+          # rather than a confusing "./gradlew: no such file" 20 lines later.
+          fail-on-cache-miss: true
       - run: |
           export SPARK_VERSION="${{ matrix.spark }}"
           export SCALA_VERSION="${{ matrix.scala }}"
