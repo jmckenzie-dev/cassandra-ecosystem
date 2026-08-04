@@ -104,7 +104,12 @@ jobs:
 
           ./scripts/build-dependencies.sh
 
-          ./gradlew --no-daemon --max-workers=2 codeCheckTasks
+          # `rat` is listed explicitly: codeCheckTasks only aggregates the subprojects'
+          # Checkstyle tasks (its dependsOn(withType(RatTask)) sits inside subprojects {},
+          # where no RatTask exists — :rat is a root-project task). It must run in a job
+          # that has a checkout, because :buildIgnoreRatList shells out to `git clean -dxn`
+          # to build the exclude list for generated files.
+          ./gradlew --no-daemon --max-workers=2 codeCheckTasks rat
       - name: Cache Maven repository
         uses: actions/cache@v4
         with:
@@ -163,7 +168,8 @@ jobs:
 
           ./scripts/build-dependencies.sh
 
-          ./gradlew codeCheckTasks
+          # See the JDK11 build for why `rat` is listed explicitly.
+          ./gradlew codeCheckTasks rat
       - name: Cache Maven repository
         uses: actions/cache@v4
         with:
@@ -249,7 +255,11 @@ jobs:
             export CASSANDRA_USE_JDK11=true
           fi
 
-          ./gradlew --stacktrace clean assemble check -x cassandra-analytics-integration-tests:test -Dcassandra.analytics.bridges.sstable_format=${{ matrix.sstable-format }}
+          # -x rat: this job has no checkout, so :buildIgnoreRatList's `git clean -dxn`
+          # fails and rat then audits generated files (cassandra-analytics-build.properties,
+          # scripts/dependency-reduced-pom.xml) that git would have excluded. The build
+          # jobs run :rat against a real checkout instead.
+          ./gradlew --stacktrace clean assemble check -x rat -x cassandra-analytics-integration-tests:test -Dcassandra.analytics.bridges.sstable_format=${{ matrix.sstable-format }}
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
