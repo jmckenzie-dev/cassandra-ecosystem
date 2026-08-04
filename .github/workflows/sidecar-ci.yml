@@ -18,10 +18,10 @@
 
 # Sidecar CI for the merged cassandra-ecosystem repo.
 #
-# Same pattern as analytics-ci.yml: the workflow ALWAYS triggers, heavy jobs run
-# only when sidecar/** (or this file) changed (the `changes` job), and `sidecar-gate`
-# always runs and is the ONLY context branch protection should require. See the header
-# of analytics-ci.yml for the full rationale (path-filtered required checks stall PRs).
+# Same pattern as analytics-ci.yml: the workflow ALWAYS triggers and heavy jobs run
+# only when sidecar/** (or this file) changed (the `changes` job). There is deliberately
+# no aggregator "gate" job and no required status check — see the analytics-ci.yml
+# header. Merge readiness is a committer judgement call.
 #
 # Commands are the sidecar repo's originals, unchanged, run via
 # `defaults.run.working-directory: sidecar`. Because `working-directory` does NOT apply
@@ -238,6 +238,20 @@ jobs:
             sidecar/build/reports/tests/**
           retention-days: 30
 
+      # Renders the JUnit XML as a pass/fail table in the job summary and annotates
+      # failing tests inline. check_name must be unique per matrix leg or the legs
+      # overwrite each other's check run. fail_on_failure stays at its default (false)
+      # so gradle's exit status remains the thing that fails the job.
+      - name: Publish test report
+        if: always()
+        uses: mikepenz/action-junit-report@v5
+        with:
+          report_paths: 'sidecar/build/test-results/**/*.xml'
+          check_name: 'Unit tests (Java ${{ matrix.java }})'
+          detailed_summary: true
+          include_time_in_summary: true
+          require_tests: false
+
       - name: Upload static analysis reports
         if: always()
         uses: actions/upload-artifact@v5
@@ -336,6 +350,16 @@ jobs:
             sidecar/build/reports/tests/**
           retention-days: 30
 
+      - name: Publish test report
+        if: always()
+        uses: mikepenz/action-junit-report@v5
+        with:
+          report_paths: 'sidecar/build/test-results/**/*.xml'
+          check_name: 'Integration lightweight (Java ${{ matrix.java }}, C* ${{ matrix.cassandra }})'
+          detailed_summary: true
+          include_time_in_summary: true
+          require_tests: false
+
   # Run heavyweight integration tests on full matrix
   integration-tests-heavyweight:
     name: Integration tests heavyweight (Java ${{ matrix.java }}, C* ${{ matrix.cassandra }})
@@ -431,6 +455,16 @@ jobs:
             sidecar/build/reports/tests/**
           retention-days: 30
 
+      - name: Publish test report
+        if: always()
+        uses: mikepenz/action-junit-report@v5
+        with:
+          report_paths: 'sidecar/build/test-results/**/*.xml'
+          check_name: 'Integration heavyweight (Java ${{ matrix.java }}, C* ${{ matrix.cassandra }})'
+          detailed_summary: true
+          include_time_in_summary: true
+          require_tests: false
+
   # Run Java 8 client unit tests for client compatibility
   unit-tests-java8:
     name: Unit tests (Java 8 - Client only)
@@ -466,6 +500,16 @@ jobs:
             sidecar/build/test-results/**
             sidecar/build/reports/tests/**
           retention-days: 30
+
+      - name: Publish test report
+        if: always()
+        uses: mikepenz/action-junit-report@v5
+        with:
+          report_paths: 'sidecar/build/test-results/**/*.xml'
+          check_name: 'Unit tests (Java 8 - Client only)'
+          detailed_summary: true
+          include_time_in_summary: true
+          require_tests: false
 
   # Build and verify Debian package
   deb-build-install:
@@ -651,38 +695,3 @@ jobs:
         run: |
           test -f docs/build/user.html
           test -f docs/build/development.html
-
-  # Always-runs aggregator. This is the ONLY sidecar context to mark required in
-  # branch protection. See analytics-ci.yml header for rationale.
-  sidecar-gate:
-    name: Sidecar CI Gate
-    if: always()
-    needs:
-      - changes
-      - build-dtest-jars
-      - checkstyle
-      - unit-tests
-      - integration-tests-lightweight
-      - integration-tests-heavyweight
-      - unit-tests-java8
-      - deb-build-install
-      - rpm-build-install
-      - docker-build
-      - docs-build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Decide gate
-        # ponytail: inline jq instead of re-actors/alls-green (not ASF-allowlisted).
-        # Every heavy job is skippable, so only failure/cancelled fails the gate.
-        env:
-          NEEDS: ${{ toJSON(needs) }}
-        run: |
-          echo "$NEEDS"
-          bad=$(printf '%s' "$NEEDS" | jq -r \
-            'to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | .key')
-          if [ -n "$bad" ]; then
-            echo "Gate failed. Jobs failed or cancelled:"
-            echo "$bad"
-            exit 1
-          fi
-          echo "Gate passed."

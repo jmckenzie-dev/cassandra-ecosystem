@@ -18,15 +18,19 @@
 # Analytics CI for the merged cassandra-ecosystem repo.
 #
 # This workflow ALWAYS triggers, but the heavy jobs only run when analytics/**
-# (or this workflow) changed — detected by the `changes` job. The `analytics-gate`
-# job always runs and is the ONLY context that branch protection should require.
-# Rationale: a workflow gated purely by `on.<event>.paths` is skipped wholesale on
-# unrelated PRs, leaving a required check stuck at "Expected — waiting for status"
-# and blocking merge. Running always + skipping heavy jobs internally keeps the
-# required gate reporting while still spending compute only on the changed project.
-# Both the path filter and the gate are plain shell: the ASF GitHub org restricts
-# `uses:` to GitHub-owned and explicitly allowlisted third-party actions, which
-# rules out dorny/paths-filter and re-actors/alls-green.
+# (or this workflow) changed — detected by the `changes` job. Running always +
+# skipping heavy jobs internally (rather than gating via `on.<event>.paths`, which
+# skips the workflow wholesale) keeps every job's status visible on the PR while
+# still spending compute only on the changed project.
+#
+# The path filter is plain shell: the ASF GitHub org restricts `uses:` to
+# GitHub-owned and explicitly allowlisted third-party actions, which ruled out
+# dorny/paths-filter at the tag we wanted.
+#
+# There is deliberately NO aggregator "gate" job and NO required status check, which
+# matches upstream cassandra-analytics and cassandra-sidecar: neither declared any
+# required contexts in .asf.yaml. Merge readiness is a committer judgement call made
+# by reading the checks list, not a programmatic forcing function.
 #
 # All build/test commands are the analytics repo's originals, unchanged, run via
 # `defaults.run.working-directory: analytics`. Only non-`run` action paths (artifact
@@ -206,6 +210,10 @@ jobs:
     needs: [changes, build-jdk11, build-jdk17]
     if: ${{ needs.changes.outputs.analytics == 'true' }}
     runs-on: ubuntu-latest
+    # checks: write lets action-junit-report publish the test-results check run.
+    permissions:
+      contents: read
+      checks: write
     strategy:
       matrix:
         include:
@@ -286,6 +294,24 @@ jobs:
             analytics/build/test-results/**
             analytics/build/reports/tests/**
           retention-days: 30
+      # Renders the JUnit XML as a pass/fail table in the job summary and annotates
+      # failing tests inline. Without this, GitHub only shows job-level red/green and
+      # the results are only readable by downloading the artifact above.
+      # check_name must be unique per matrix leg or the legs overwrite each other's
+      # check run. fail_on_failure is left at its default (false): gradle has already
+      # failed the job, and re-failing here would mask its exit status.
+      - name: Publish test report
+        if: always()
+        uses: mikepenz/action-junit-report@v5
+        with:
+          report_paths: 'analytics/build/test-results/**/*.xml'
+          check_name: 'Unit tests s${{ matrix.scala }}-${{ matrix.sstable-format }}-C${{ matrix.cassandra }}-Spark${{ matrix.spark }}-JDK${{ matrix.jdk }}'
+          detailed_summary: true
+          include_time_in_summary: true
+          # Some legs legitimately run zero tests (see the C4.0 exclusions below), so a
+          # missing/empty report must not fail the job — the totals in the table make
+          # "nothing ran" visible without turning it into a hard error.
+          require_tests: false
 
   integration-test:
     name: Integration test - ${{ matrix.config }} (${{ matrix.job_index }})
@@ -294,6 +320,10 @@ jobs:
     needs: [changes, build-jdk11, build-jdk17]
     if: ${{ needs.changes.outputs.analytics == 'true' }}
     runs-on: ubuntu-latest
+    # checks: write lets action-junit-report publish the test-results check run.
+    permissions:
+      contents: read
+      checks: write
     strategy:
       # GitHub Actions generate a cross-product of 'config' × 'job_index' (4 × 5 = 20 jobs).
       # The 'include' entries don't add new combinations — they augment existing ones
@@ -416,28 +446,19 @@ jobs:
           name: integration-tests-${{ matrix.config }}-${{ matrix.job_index }}
           path: analytics/test-reports/
           retention-days: 30
-
-  # Always-runs aggregator. This is the ONLY analytics context to mark required in
-  # branch protection. allowed-skips lets the heavy jobs be skipped (unrelated PR)
-  # without stalling the required check; a job that RUNS and fails still fails the gate.
-  analytics-gate:
-    name: Analytics CI Gate
-    if: always()
-    needs: [changes, build-jdk11, build-jdk17, unit-test, integration-test]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Decide gate
-        # ponytail: inline jq instead of re-actors/alls-green (not ASF-allowlisted).
-        # Every heavy job is skippable, so only failure/cancelled fails the gate.
-        env:
-          NEEDS: ${{ toJSON(needs) }}
-        run: |
-          echo "$NEEDS"
-          bad=$(printf '%s' "$NEEDS" | jq -r \
-            'to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | .key')
-          if [ -n "$bad" ]; then
-            echo "Gate failed. Jobs failed or cancelled:"
-            echo "$bad"
-            exit 1
-          fi
-          echo "Gate passed."
+      # See the unit-test job for why check_name is per-leg and require_tests is false.
+      # Reads gradle's canonical output dir (build.gradle:258 points every subproject's
+      # junitXml at rootProject build/test-results/<project>/<task>), NOT the
+      # test-reports/ copies uploaded above: the shard loop re-runs
+      # `find build/test-results` after every test class, so each pass copies the
+      # previous passes' XML again and the copies double-count. `clean` at the top of
+      # the job means this dir holds exactly one XML per class this shard ran.
+      - name: Publish test report
+        if: always()
+        uses: mikepenz/action-junit-report@v5
+        with:
+          report_paths: 'analytics/build/test-results/**/*.xml'
+          check_name: 'Integration tests ${{ matrix.config }} (${{ matrix.job_index }})'
+          detailed_summary: true
+          include_time_in_summary: true
+          require_tests: false
