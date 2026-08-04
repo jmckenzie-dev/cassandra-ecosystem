@@ -45,8 +45,7 @@ github:
     - CASSANDRASC
     - CASSANDRA
 
-  # Converge on rulesets (analytics' mechanism) and carry sidecar's strict
-  # required-status-checks semantics.
+  # Converge on rulesets (analytics' mechanism).
   rulesets:
     - name: "Default Branch Protection"
       type: branch

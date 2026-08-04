@@ -23,10 +23,6 @@
 # skips the workflow wholesale) keeps every job's status visible on the PR while
 # still spending compute only on the changed project.
 #
-# The path filter is plain shell: the ASF GitHub org restricts `uses:` to
-# GitHub-owned and explicitly allowlisted third-party actions, which ruled out
-# dorny/paths-filter at the tag we wanted.
-#
 # There is deliberately NO aggregator "gate" job and NO required status check, which
 # matches upstream cassandra-analytics and cassandra-sidecar: neither declared any
 # required contexts in .asf.yaml. Merge readiness is a committer judgement call made
@@ -62,28 +58,16 @@ jobs:
       analytics: ${{ steps.filter.outputs.analytics }}
     steps:
       - uses: actions/checkout@v4
+      # Third-party actions must be pinned to a SHA on the ASF allowlist
+      # (apache/infrastructure-actions/approved_patterns.yml); a bare tag like @v3
+      # matches no allowlist entry and makes the job fail at startup with no logs.
+      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        id: filter
         with:
-          fetch-depth: 0
-      - id: filter
-        working-directory: .
-        # ponytail: inline git diff instead of dorny/paths-filter — ASF org only
-        # permits GitHub-owned and explicitly allowlisted third-party actions.
-        env:
-          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-          HEAD_SHA: ${{ github.sha }}
-        run: |
-          base="$BASE_SHA"
-          # No usable base (workflow_dispatch, branch creation, force push): build everything.
-          if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
-            echo "analytics=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if git diff --name-only "$base" "$HEAD_SHA" \
-               | grep -qE '^(analytics/|\.github/workflows/analytics-ci\.yml$)'; then
-            echo "analytics=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "analytics=false" >> "$GITHUB_OUTPUT"
-          fi
+          filters: |
+            analytics:
+              - 'analytics/**'
+              - '.github/workflows/analytics-ci.yml'
 
   build-jdk11:
     name: Compile and build (JDK 11)
@@ -447,7 +431,7 @@ jobs:
           path: analytics/test-reports/
           retention-days: 30
       # See the unit-test job for why check_name is per-leg and require_tests is false.
-      # Reads gradle's canonical output dir (build.gradle:258 points every subproject's
+      # Reads gradle's canonical output dir (build.gradle points every subproject's
       # junitXml at rootProject build/test-results/<project>/<task>), NOT the
       # test-reports/ copies uploaded above: the shard loop re-runs
       # `find build/test-results` after every test class, so each pass copies the
