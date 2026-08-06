@@ -18,6 +18,8 @@
 #
 -->
 
+# REVERT THIS - testing CI kickoff
+
 # Testing Guide for Apache Cassandra Sidecar
 
 This document provides a comprehensive guide to running tests for the Apache Cassandra Sidecar project.
