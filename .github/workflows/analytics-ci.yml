@@ -194,10 +194,10 @@ jobs:
     needs: [changes, build-jdk11, build-jdk17]
     if: ${{ needs.changes.outputs.analytics == 'true' }}
     runs-on: ubuntu-latest
-    # checks: write lets action-junit-report publish the test-results check run.
+    # No checks: write. action-junit-report runs with annotate_only, which never touches
+    # the check-runs API — see the "Publish test report" steps for why.
     permissions:
       contents: read
-      checks: write
     strategy:
       matrix:
         include:
@@ -284,6 +284,13 @@ jobs:
       # check_name must be unique per matrix leg or the legs overwrite each other's
       # check run. fail_on_failure is left at its default (false): gradle has already
       # failed the job, and re-failing here would mask its exit status.
+      #
+      # annotate_only skips the check-runs API and emits ::error log commands instead.
+      # On a PR from a fork the GITHUB_TOKEN is read-only no matter what `permissions:`
+      # says, so creating a check run 403s — which is how this step used to fail on
+      # every contributor PR. Log-command annotations need no token at all.
+      # skip_success_summary keeps green legs out of the run summary so the aggregate
+      # in the test-report job stays readable.
       - name: Publish test report
         if: always()
         uses: mikepenz/action-junit-report@v5
@@ -296,6 +303,8 @@ jobs:
           # missing/empty report must not fail the job — the totals in the table make
           # "nothing ran" visible without turning it into a hard error.
           require_tests: false
+          annotate_only: true
+          skip_success_summary: true
 
   integration-test:
     name: Integration test - ${{ matrix.config }} (${{ matrix.job_index }})
@@ -304,10 +313,10 @@ jobs:
     needs: [changes, build-jdk11, build-jdk17]
     if: ${{ needs.changes.outputs.analytics == 'true' }}
     runs-on: ubuntu-latest
-    # checks: write lets action-junit-report publish the test-results check run.
+    # No checks: write. action-junit-report runs with annotate_only, which never touches
+    # the check-runs API — see the "Publish test report" steps for why.
     permissions:
       contents: read
-      checks: write
     strategy:
       # GitHub Actions generate a cross-product of 'config' × 'job_index' (4 × 5 = 20 jobs).
       # The 'include' entries don't add new combinations — they augment existing ones
@@ -427,22 +436,68 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: integration-tests-${{ matrix.config }}-${{ matrix.job_index }}
+          name: integration-test-results-${{ matrix.config }}-${{ matrix.job_index }}
           path: analytics/test-reports/
           retention-days: 30
+      # MUST read the test-reports/ copies, not gradle's build/test-results/. The shard
+      # loop invokes gradle once per test class, and gradle deletes a test task's output
+      # dir before re-running it, so build/test-results/ holds only the LAST class of the
+      # shard — a leg that failed on class 6 of 11 reported "2 tests, 2 passed" from
+      # class 11 and looked green. The per-class copies do not double-count for the same
+      # reason: each `find` after a gradle run sees only that run's XML.
       # See the unit-test job for why check_name is per-leg and require_tests is false.
-      # Reads gradle's canonical output dir (build.gradle points every subproject's
-      # junitXml at rootProject build/test-results/<project>/<task>), NOT the
-      # test-reports/ copies uploaded above: the shard loop re-runs
-      # `find build/test-results` after every test class, so each pass copies the
-      # previous passes' XML again and the copies double-count. `clean` at the top of
-      # the job means this dir holds exactly one XML per class this shard ran.
       - name: Publish test report
         if: always()
         uses: mikepenz/action-junit-report@v5
         with:
-          report_paths: 'analytics/build/test-results/**/*.xml'
+          report_paths: 'analytics/test-reports/**/*.xml'
           check_name: 'Integration tests ${{ matrix.config }} (${{ matrix.job_index }})'
           detailed_summary: true
           include_time_in_summary: true
           require_tests: false
+          annotate_only: true
+          skip_success_summary: true
+
+  # Single top-level failure dashboard for the whole run: one table listing every
+  # failing suite:test with a one-line failure detail, instead of 24 job summaries and
+  # a wall of PASSED log lines to click through.
+  #
+  # This is a job summary, not a check run — job summaries are written to a local file
+  # ($GITHUB_STEP_SUMMARY) and so render identically on fork PRs, where GITHUB_TOKEN is
+  # read-only and the check-runs API is unavailable.
+  #
+  # This is NOT a merge gate: it must never be a required status check (see the header
+  # comment). fail_on_failure stays at its default (false) so this job goes green even
+  # when it is reporting failures — the individual test jobs are what turn the run red.
+  test-report:
+    name: Test report
+    needs: [changes, unit-test, integration-test]
+    # always() so the report is produced when the test jobs fail — which is the only
+    # time anyone reads it. Still gated on the changes filter: with analytics untouched
+    # the test jobs are skipped and there are no artifacts to aggregate.
+    if: ${{ always() && needs.changes.outputs.analytics == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # Matches unit-test-results-* and integration-test-results-*. No merge-multiple:
+      # every leg's XML would land in one flat dir and same-named files (TEST-<class>.xml
+      # for a class sharded across configs) would clobber each other.
+      - name: Download all test results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*results*'
+          path: test-results
+      - name: Aggregate test report
+        uses: mikepenz/action-junit-report@v5
+        with:
+          report_paths: 'test-results/**/*.xml'
+          detailed_summary: true
+          include_time_in_summary: true
+          # A leg that died before writing any XML leaves nothing to aggregate; the run
+          # is already red from that job, so do not compound it with a second failure.
+          require_tests: false
+          annotate_only: true
+          # Unlike the per-leg steps this one always renders: on a fully green run the
+          # totals row is the "5000 passed, 0 failed" confirmation.
+          skip_success_summary: false

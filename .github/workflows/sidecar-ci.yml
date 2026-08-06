@@ -185,7 +185,8 @@ jobs:
     if: ${{ needs.changes.outputs.sidecar == 'true' }}
     permissions:
       contents: read
-      checks: write
+      # No checks: write — action-junit-report runs with annotate_only and never touches
+      # the check-runs API. See the "Publish test report" steps for why.
     strategy:
       fail-fast: false
       matrix:
@@ -238,6 +239,14 @@ jobs:
           detailed_summary: true
           include_time_in_summary: true
           require_tests: false
+          # annotate_only skips the check-runs API and emits ::error log commands instead.
+          # On a PR from a fork the GITHUB_TOKEN is read-only regardless of what
+          # `permissions:` says, so creating a check run 403s — which is how this step
+          # used to fail on every contributor PR. Log annotations need no token.
+          annotate_only: true
+          # Green legs contribute nothing to the run summary, keeping the aggregate table
+          # in the test-report job readable.
+          skip_success_summary: true
 
       - name: Upload static analysis reports
         if: always()
@@ -258,7 +267,8 @@ jobs:
     if: ${{ needs.changes.outputs.sidecar == 'true' }}
     permissions:
       contents: read
-      checks: write
+      # No checks: write — action-junit-report runs with annotate_only and never touches
+      # the check-runs API. See the "Publish test report" steps for why.
     strategy:
       fail-fast: false
       matrix:
@@ -346,6 +356,14 @@ jobs:
           detailed_summary: true
           include_time_in_summary: true
           require_tests: false
+          # annotate_only skips the check-runs API and emits ::error log commands instead.
+          # On a PR from a fork the GITHUB_TOKEN is read-only regardless of what
+          # `permissions:` says, so creating a check run 403s — which is how this step
+          # used to fail on every contributor PR. Log annotations need no token.
+          annotate_only: true
+          # Green legs contribute nothing to the run summary, keeping the aggregate table
+          # in the test-report job readable.
+          skip_success_summary: true
 
   # Run heavyweight integration tests on full matrix
   integration-tests-heavyweight:
@@ -355,7 +373,8 @@ jobs:
     if: ${{ needs.changes.outputs.sidecar == 'true' }}
     permissions:
       contents: read
-      checks: write
+      # No checks: write — action-junit-report runs with annotate_only and never touches
+      # the check-runs API. See the "Publish test report" steps for why.
     strategy:
       fail-fast: false
       matrix:
@@ -451,6 +470,14 @@ jobs:
           detailed_summary: true
           include_time_in_summary: true
           require_tests: false
+          # annotate_only skips the check-runs API and emits ::error log commands instead.
+          # On a PR from a fork the GITHUB_TOKEN is read-only regardless of what
+          # `permissions:` says, so creating a check run 403s — which is how this step
+          # used to fail on every contributor PR. Log annotations need no token.
+          annotate_only: true
+          # Green legs contribute nothing to the run summary, keeping the aggregate table
+          # in the test-report job readable.
+          skip_success_summary: true
 
   # Run Java 8 client unit tests for client compatibility
   unit-tests-java8:
@@ -460,7 +487,8 @@ jobs:
     if: ${{ needs.changes.outputs.sidecar == 'true' }}
     permissions:
       contents: read
-      checks: write
+      # No checks: write — action-junit-report runs with annotate_only and never touches
+      # the check-runs API. See the "Publish test report" steps for why.
 
     steps:
       - name: Checkout repository
@@ -497,6 +525,14 @@ jobs:
           detailed_summary: true
           include_time_in_summary: true
           require_tests: false
+          # annotate_only skips the check-runs API and emits ::error log commands instead.
+          # On a PR from a fork the GITHUB_TOKEN is read-only regardless of what
+          # `permissions:` says, so creating a check run 403s — which is how this step
+          # used to fail on every contributor PR. Log annotations need no token.
+          annotate_only: true
+          # Green legs contribute nothing to the run summary, keeping the aggregate table
+          # in the test-report job readable.
+          skip_success_summary: true
 
   # Build and verify Debian package
   deb-build-install:
@@ -682,3 +718,51 @@ jobs:
         run: |
           test -f docs/build/user.html
           test -f docs/build/development.html
+
+  # Single top-level failure dashboard for the whole run: one table listing every failing
+  # suite:test with a one-line failure detail, instead of one job summary per matrix leg
+  # and a wall of PASSED log lines to click through.
+  #
+  # This is a job summary, not a check run — job summaries are written to a local file
+  # ($GITHUB_STEP_SUMMARY) and so render identically on fork PRs, where GITHUB_TOKEN is
+  # read-only and the check-runs API is unavailable.
+  #
+  # This is NOT a merge gate and must never be a required status check. fail_on_failure
+  # stays at its default (false) so this job goes green even when it is reporting
+  # failures — the individual test jobs are what turn the run red.
+  test-report:
+    name: Test report
+    runs-on: ubuntu-latest
+    needs: [changes, unit-tests, unit-tests-java8, integration-tests-lightweight, integration-tests-heavyweight]
+    # always() so the report is produced when the test jobs fail — which is the only time
+    # anyone reads it. Still gated on the changes filter: with sidecar untouched the test
+    # jobs are skipped and there are no artifacts to aggregate.
+    if: ${{ always() && needs.changes.outputs.sidecar == 'true' }}
+    permissions:
+      contents: read
+
+    steps:
+      # Matches unit-test-results-* and integration-{light,heavy}weight-results-*, and
+      # not the checkstyle-reports / static-analysis-reports-* artifacts. No
+      # merge-multiple: every leg's XML would land in one flat dir and same-named files
+      # (TEST-<class>.xml, produced by every java × cassandra leg) would clobber each
+      # other.
+      - name: Download all test results
+        uses: actions/download-artifact@v5
+        with:
+          pattern: '*results*'
+          path: test-results
+
+      - name: Aggregate test report
+        uses: mikepenz/action-junit-report@v5
+        with:
+          report_paths: 'test-results/**/*.xml'
+          detailed_summary: true
+          include_time_in_summary: true
+          # A leg that died before writing any XML leaves nothing to aggregate; the run is
+          # already red from that job, so do not compound it with a second failure.
+          require_tests: false
+          annotate_only: true
+          # Unlike the per-leg steps this one always renders: on a fully green run the
+          # totals row is the "N passed, 0 failed" confirmation.
+          skip_success_summary: false

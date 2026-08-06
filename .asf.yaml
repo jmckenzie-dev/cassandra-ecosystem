@@ -67,6 +67,11 @@ github:
       # They are path-skipped on single-project PRs, and a skipped required context sits
       # at "Expected — waiting for status" forever. That needs an always-running
       # aggregator job, which is what was removed here.
+      #
+      # The "Test report" job in each CI workflow is NOT that aggregator. It only renders
+      # the failing-test dashboard into the run summary, and it carries the same
+      # path-skip condition as the test jobs, so making it required would hang exactly
+      # as described above.
 
 notifications:
   commits:      commits@cassandra.apache.org
