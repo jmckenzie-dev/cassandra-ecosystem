@@ -36,6 +36,10 @@ on:
     branches: [trunk]
   push:
     branches: [trunk]
+  # Parity with analytics-ci.yml. GitHub silently drops workflow events on occasion and
+  # never replays them; a branch in this repo can then be re-run by hand instead of
+  # waiting for the next push. (Does not help a fork PR — see below.)
+  workflow_dispatch:
 
 # Cancel in-progress runs for PRs when new commits are pushed
 concurrency:
